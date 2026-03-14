@@ -40,6 +40,9 @@ class TransactionResponse(BaseModel):
     fees: float
     net_amount: Optional[float]
     currency: str
+    fx_rate_to_aud: Optional[float] = None
+    net_amount_aud: Optional[float] = None
+    price_per_unit_aud: Optional[float] = None
     transacted_at: datetime
     source: str
     notes: Optional[str]
@@ -106,6 +109,9 @@ async def list_transactions(
             fees=float(txn.fees or 0),
             net_amount=float(txn.net_amount) if txn.net_amount else None,
             currency=txn.currency,
+            fx_rate_to_aud=float(txn.fx_rate_to_aud) if txn.fx_rate_to_aud else None,
+            net_amount_aud=float(txn.net_amount_aud) if txn.net_amount_aud else None,
+            price_per_unit_aud=float(txn.price_per_unit_aud) if txn.price_per_unit_aud else None,
             transacted_at=txn.transacted_at,
             source=txn.source,
             notes=txn.notes,
@@ -169,7 +175,11 @@ async def create_transaction(
         quantity=float(txn.quantity) if txn.quantity else None,
         price_per_unit=float(txn.price_per_unit) if txn.price_per_unit else None,
         fees=float(txn.fees), net_amount=float(txn.net_amount) if txn.net_amount else None,
-        currency=txn.currency, transacted_at=txn.transacted_at,
+        currency=txn.currency,
+        fx_rate_to_aud=float(txn.fx_rate_to_aud) if txn.fx_rate_to_aud else None,
+        net_amount_aud=float(txn.net_amount_aud) if txn.net_amount_aud else None,
+        price_per_unit_aud=float(txn.price_per_unit_aud) if txn.price_per_unit_aud else None,
+        transacted_at=txn.transacted_at,
         source=txn.source, notes=txn.notes, created_at=txn.created_at,
     )
 

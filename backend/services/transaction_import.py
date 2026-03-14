@@ -48,8 +48,15 @@ TYPE_ALIASES = {
     "exchtrade": "BUY",  # IBKR — determined by quantity sign
     # Sells
     "sell": "SELL", "sold": "SELL", "s": "SELL",
-    # Dividends
+    # Dividends & Distributions
     "dividend": "DIVIDEND", "div": "DIVIDEND", "dividends reinvested": "DIVIDEND",
+    "dividends": "DIVIDEND", "cash dividend": "DIVIDEND",
+    "payment in lieu of dividends": "DIVIDEND", "payment in lieu": "DIVIDEND",
+    "distribution": "DISTRIBUTION", "dist": "DISTRIBUTION",
+    "managed fund distribution": "DISTRIBUTION", "trust distribution": "DISTRIBUTION",
+    "capital gains distribution": "DISTRIBUTION", "return of capital": "DISTRIBUTION",
+    # Interest
+    "interest": "INTEREST", "bond interest": "INTEREST", "credit interest": "INTEREST",
     # Transfers
     "transfer": "TRANSFER_IN", "deposit": "DEPOSIT", "withdrawal": "WITHDRAWAL",
     # Crypto
@@ -603,6 +610,11 @@ class TransactionImporter:
                     else:
                         net_amount = -(net_amount + parsed.fees)
 
+                # AUD conversion — for AUD txns rate=1, for USD use approximate rate
+                fx_rate_aud = self._get_aud_rate(parsed.currency)
+                net_amount_aud = (net_amount * fx_rate_aud) if net_amount is not None else None
+                price_aud = (parsed.price * fx_rate_aud) if parsed.price is not None else None
+
                 txn = Transaction(
                     account_id=account_id,
                     user_id=user_id,
@@ -613,6 +625,9 @@ class TransactionImporter:
                     fees=parsed.fees,
                     net_amount=net_amount,
                     currency=parsed.currency,
+                    fx_rate_to_aud=fx_rate_aud,
+                    net_amount_aud=net_amount_aud,
+                    price_per_unit_aud=price_aud,
                     transacted_at=parsed.date,
                     source=source,
                     import_hash=parsed.import_hash,
@@ -665,6 +680,28 @@ class TransactionImporter:
             await self.db.flush()
 
         return asset.id
+
+    # ─── AUD FX Rate ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _get_aud_rate(currency: str) -> Decimal:
+        """
+        Get approximate FX rate to AUD.
+        For production, this should fetch RBA daily rates.
+        Current static rates are approximate mid-market rates.
+        """
+        STATIC_RATES = {
+            "AUD": Decimal("1.0"),
+            "USD": Decimal("1.55"),   # ~1 USD = 1.55 AUD
+            "GBP": Decimal("1.95"),
+            "EUR": Decimal("1.65"),
+            "NZD": Decimal("1.08"),
+            "CAD": Decimal("1.10"),
+            "JPY": Decimal("0.0105"),
+            "HKD": Decimal("0.20"),
+            "SGD": Decimal("1.15"),
+        }
+        return STATIC_RATES.get(currency.upper(), Decimal("1.0"))
 
     # ─── Date Parsing ────────────────────────────────────────────────────
 

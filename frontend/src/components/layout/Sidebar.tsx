@@ -11,8 +11,7 @@ import { useAuth } from "@/lib/auth/AuthContext";
 
 const NAV_ITEMS = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { href: "/dashboard/transactions", label: "Transactions", icon: ArrowLeftRight },
-  { href: "/dashboard/import", label: "Import", icon: Upload },
+  { href: "/dashboard/transactions", label: "Investments", icon: ArrowLeftRight },
   { href: "/dashboard/analytics", label: "Analytics", icon: BarChart2 },
   { href: "/dashboard/advisor", label: "AI Advisor", icon: Bot },
   { href: "/dashboard/tax", label: "Tax Center", icon: FileText },
