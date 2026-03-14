@@ -37,12 +37,17 @@ class AccountResponse(BaseModel):
     account_subtype: Optional[str]
     currency: str
     is_taxable: bool
+    is_active: bool
     sync_status: str
     last_synced_at: Optional[datetime]
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class AccountToggle(BaseModel):
+    is_active: bool
 
 
 class HoldingResponse(BaseModel):
@@ -148,6 +153,40 @@ async def create_account(
     return account
 
 
+@router.get("/accounts/all", response_model=list[AccountResponse])
+async def list_all_accounts(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all accounts including inactive (for Investments page)."""
+    result = await db.execute(
+        select(Account).where(Account.user_id == current_user.id)
+        .order_by(Account.created_at)
+    )
+    return result.scalars().all()
+
+
+@router.patch("/accounts/{account_id}", response_model=AccountResponse)
+async def toggle_account(
+    account_id: str,
+    body: AccountToggle,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Toggle account active/inactive for dashboard calculations."""
+    result = await db.execute(
+        select(Account).where(Account.id == account_id, Account.user_id == current_user.id)
+    )
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    account.is_active = body.is_active
+    await db.commit()
+    await db.refresh(account)
+    await cache_invalidate_user(current_user.id)
+    return account
+
+
 @router.delete("/accounts/{account_id}", status_code=204)
 async def delete_account(
     account_id: str,
@@ -175,8 +214,27 @@ async def get_portfolio_summary(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get consolidated portfolio summary across all (or specified) accounts.
+    Get consolidated portfolio summary across active (or specified) accounts.
+    Only includes active accounts unless specific account_ids are provided.
     """
+    # If no specific accounts requested, only use active ones
+    if not account_ids:
+        active_result = await db.execute(
+            select(Account.id).where(
+                Account.user_id == current_user.id,
+                Account.is_active == True,
+            )
+        )
+        account_ids = [row[0] for row in active_result.all()]
+        if not account_ids:
+            return _to_summary_response(PortfolioSummary(
+                total_market_value=Decimal(0), total_cost_basis=Decimal(0),
+                total_unrealized_gain=Decimal(0), total_unrealized_gain_pct=Decimal(0),
+                total_realized_gain_short=Decimal(0), total_realized_gain_long=Decimal(0),
+                dividend_income=Decimal(0), staking_income=Decimal(0),
+                holdings=[], as_of=as_of or datetime.now(timezone.utc),
+            ))
+
     engine = _get_engine(db)
     summary = await engine.get_portfolio_summary(
         user_id=current_user.id,
@@ -210,10 +268,19 @@ async def get_net_worth(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get total net worth breakdown by asset class."""
+    """Get total net worth breakdown by asset class (active accounts only)."""
+    active_result = await db.execute(
+        select(Account.id).where(
+            Account.user_id == current_user.id,
+            Account.is_active == True,
+        )
+    )
+    active_ids = [row[0] for row in active_result.all()]
+
     engine = _get_engine(db)
     summary = await engine.get_portfolio_summary(
         user_id=current_user.id,
+        account_ids=active_ids or None,
         cost_basis_method=current_user.cost_basis_method,
     )
 

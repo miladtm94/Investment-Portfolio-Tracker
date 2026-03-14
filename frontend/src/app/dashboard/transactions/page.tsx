@@ -6,12 +6,11 @@ import { api } from "@/lib/api/client";
 import { formatCurrency, formatDate } from "@/lib/utils/formatters";
 import {
   Plus, Upload, X, ChevronDown, ChevronRight, Trash2,
-  ExternalLink, FileText, Loader2, CheckCircle, AlertTriangle,
+  FileText, AlertTriangle, Eye, EyeOff,
 } from "lucide-react";
 import clsx from "clsx";
 import { useDropzone } from "react-dropzone";
 import toast from "react-hot-toast";
-import { useCurrency } from "@/lib/context/CurrencyContext";
 
 // ─── Type Styles ──────────────────────────────────────────────────────────
 
@@ -152,34 +151,6 @@ const BROKERS: BrokerInfo[] = [
     ],
     fileTypes: "CSV",
   },
-  {
-    id: "coinbase",
-    label: "Coinbase",
-    country: "INTL",
-    currency: "USD",
-    instructions: [
-      "Login to your Coinbase account",
-      "Go to Taxes / Reports in Settings",
-      "Click 'Generate report' for Transaction history",
-      "Select your date range and download CSV",
-      "Upload your file below",
-    ],
-    fileTypes: "CSV",
-  },
-  {
-    id: "schwab",
-    label: "Charles Schwab",
-    country: "US",
-    currency: "USD",
-    instructions: [
-      "Login to your Schwab account",
-      "Go to Accounts > History",
-      "Set your date range and filter by Trades",
-      "Click Export to download as CSV",
-      "Upload your file below",
-    ],
-    fileTypes: "CSV",
-  },
 ];
 
 // ─── Account Types ────────────────────────────────────────────────────────
@@ -207,8 +178,7 @@ function formatInCurrency(value: number | null | undefined, currency: string = "
 function CreateAccountForm({ broker, onCreated }: { broker?: BrokerInfo; onCreated: () => void }) {
   const [name, setName] = useState(broker ? `${broker.label}` : "");
   const [type, setType] = useState(
-    broker?.currency === "USD" && broker?.id !== "kraken" ? "BROKERAGE" :
-    broker?.id === "kraken" || broker?.id === "coinbase" ? "CRYPTO_EXCHANGE" : "BROKERAGE"
+    broker?.id === "kraken" ? "CRYPTO_EXCHANGE" : "BROKERAGE"
   );
   const [currency, setCurrency] = useState(broker?.currency || "AUD");
   const queryClient = useQueryClient();
@@ -221,9 +191,9 @@ function CreateAccountForm({ broker, onCreated }: { broker?: BrokerInfo; onCreat
         account_type: type,
         currency,
       }).then((r) => r.data),
-    onSuccess: (data) => {
+    onSuccess: () => {
       toast.success("Account created");
-      queryClient.invalidateQueries({ queryKey: ["portfolio", "accounts"] });
+      queryClient.invalidateQueries({ queryKey: ["portfolio"] });
       onCreated();
     },
     onError: () => toast.error("Failed to create account"),
@@ -316,6 +286,7 @@ function BrokerUploadPanel({
           { id: toastId, duration: 5000 }
         );
         queryClient.invalidateQueries({ queryKey: ["transactions"] });
+        queryClient.invalidateQueries({ queryKey: ["portfolio"] });
         onImportDone();
       } catch (e: any) {
         toast.error(`Import failed: ${e?.response?.data?.detail ?? "Check file format."}`, { id: toastId });
@@ -418,43 +389,248 @@ function BrokerUploadPanel({
   );
 }
 
+// ─── Account Card with Transactions ───────────────────────────────────────
+
+function AccountCard({
+  account,
+  transactions,
+  onToggle,
+  onRemove,
+}: {
+  account: any;
+  transactions: any[];
+  onToggle: (id: string, active: boolean) => void;
+  onRemove: (id: string, name: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(account.is_active);
+  const isActive = account.is_active;
+  const txCount = transactions.length;
+  const isInflow = (t: string) =>
+    ["BUY", "TRANSFER_IN", "DEPOSIT", "STAKE_REWARD", "DIVIDEND", "DISTRIBUTION", "INTEREST"].includes(t);
+
+  const totalInvested = transactions
+    .filter((t) => t.transaction_type === "BUY")
+    .reduce((sum: number, t: any) => sum + Math.abs(t.net_amount ?? 0), 0);
+
+  return (
+    <div className={clsx(
+      "card-glass overflow-hidden transition-all",
+      !isActive && "opacity-60"
+    )}>
+      {/* Account Header */}
+      <div className="flex items-center gap-3 p-4 border-b border-gray-800">
+        {/* Checkbox */}
+        <button
+          onClick={() => onToggle(account.id, !isActive)}
+          className={clsx(
+            "flex-shrink-0 w-5 h-5 rounded border-2 flex items-center justify-center transition-all",
+            isActive
+              ? "bg-blue-600 border-blue-600"
+              : "border-gray-600 hover:border-gray-400"
+          )}
+          title={isActive ? "Included in dashboard — click to exclude" : "Excluded from dashboard — click to include"}
+        >
+          {isActive && (
+            <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+            </svg>
+          )}
+        </button>
+
+        {/* Account Info */}
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="flex-1 flex items-center gap-3 text-left min-w-0"
+        >
+          <div className="w-9 h-9 rounded-lg bg-gray-800 border border-gray-700 flex items-center justify-center text-xs font-bold text-gray-300 flex-shrink-0">
+            {(account.institution_name || account.name).slice(0, 2).toUpperCase()}
+          </div>
+          <div className="min-w-0">
+            <div className="font-medium text-gray-100 text-sm truncate">
+              {account.name}
+            </div>
+            <div className="text-xs text-gray-500 flex items-center gap-2">
+              <span>{account.currency}</span>
+              <span>·</span>
+              <span>{txCount} transaction{txCount !== 1 ? "s" : ""}</span>
+              {totalInvested > 0 && (
+                <>
+                  <span>·</span>
+                  <span>{formatCurrency(totalInvested, true, account.currency)} invested</span>
+                </>
+              )}
+            </div>
+          </div>
+          {expanded ? (
+            <ChevronDown className="w-4 h-4 text-gray-500 ml-auto flex-shrink-0" />
+          ) : (
+            <ChevronRight className="w-4 h-4 text-gray-500 ml-auto flex-shrink-0" />
+          )}
+        </button>
+
+        {/* Status + Remove */}
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <span className={clsx(
+            "text-xs px-2 py-0.5 rounded-full font-medium",
+            isActive
+              ? "text-green-400 bg-green-400/10"
+              : "text-gray-500 bg-gray-500/10"
+          )}>
+            {isActive ? "Active" : "Excluded"}
+          </span>
+          <button
+            onClick={() => onRemove(account.id, account.name)}
+            className="text-gray-600 hover:text-red-400 transition-colors p-1 rounded hover:bg-red-400/10"
+            title="Remove account and all transactions"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+
+      {/* Transactions Table */}
+      {expanded && txCount > 0 && (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-xs text-gray-500 uppercase tracking-wider border-b border-gray-800/50">
+                <th className="text-left p-2.5 pl-4">Date</th>
+                <th className="text-left p-2.5">Type</th>
+                <th className="text-left p-2.5">Asset</th>
+                <th className="text-right p-2.5">Qty</th>
+                <th className="text-right p-2.5">Price</th>
+                <th className="text-right p-2.5">Fees</th>
+                <th className="text-right p-2.5">Amount</th>
+                <th className="text-center p-2.5 pr-4">CCY</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-800/30">
+              {transactions.map((txn: any) => {
+                const typeStyle = TYPE_STYLES[txn.transaction_type] || "text-gray-400 bg-gray-400/10";
+                const inflow = isInflow(txn.transaction_type);
+                const ccy = txn.currency || "USD";
+
+                return (
+                  <tr key={txn.id} className="hover:bg-gray-800/20 transition-colors">
+                    <td className="p-2.5 pl-4 text-gray-400 whitespace-nowrap text-xs">
+                      {formatDate(txn.transacted_at)}
+                    </td>
+                    <td className="p-2.5">
+                      <span className={clsx("text-xs font-medium px-2 py-0.5 rounded-full", typeStyle)}>
+                        {TYPE_LABELS[txn.transaction_type] || txn.transaction_type}
+                      </span>
+                    </td>
+                    <td className="p-2.5 font-medium text-gray-100 text-xs">
+                      {txn.symbol || "—"}
+                    </td>
+                    <td className="p-2.5 text-right font-mono text-xs">
+                      {txn.quantity != null ? (
+                        <span className={inflow ? "text-green-400" : "text-red-400"}>
+                          {inflow ? "+" : "-"}{Math.abs(txn.quantity).toLocaleString(undefined, { maximumFractionDigits: 6 })}
+                        </span>
+                      ) : "—"}
+                    </td>
+                    <td className="p-2.5 text-right font-mono text-gray-400 text-xs">
+                      {txn.price_per_unit ? formatInCurrency(txn.price_per_unit, ccy) : "—"}
+                    </td>
+                    <td className="p-2.5 text-right font-mono text-gray-500 text-xs">
+                      {txn.fees && txn.fees > 0 ? formatInCurrency(txn.fees, ccy) : "—"}
+                    </td>
+                    <td className="p-2.5 text-right font-mono text-xs font-medium">
+                      {txn.net_amount != null ? (
+                        <span className={txn.net_amount >= 0 ? "text-green-400" : "text-red-400"}>
+                          {formatInCurrency(txn.net_amount, ccy)}
+                        </span>
+                      ) : "—"}
+                    </td>
+                    <td className="p-2.5 pr-4 text-center">
+                      <span className={clsx(
+                        "text-xs px-1.5 py-0.5 rounded font-medium",
+                        ccy === "AUD" ? "text-blue-400 bg-blue-400/10" :
+                        ccy === "USD" ? "text-green-400 bg-green-400/10" :
+                        "text-gray-400 bg-gray-400/10"
+                      )}>
+                        {ccy}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {expanded && txCount === 0 && (
+        <div className="p-6 text-center text-gray-500 text-sm">
+          No transactions yet. Import a CSV file to populate this account.
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main Page ────────────────────────────────────────────────────────────
 
 export default function TransactionsPage() {
   const [showImport, setShowImport] = useState(false);
   const [selectedBroker, setSelectedBroker] = useState<BrokerInfo | null>(null);
-  const { displayCurrency } = useCurrency();
   const queryClient = useQueryClient();
 
-  const { data: transactions = [], isLoading, refetch } = useQuery({
+  // Fetch ALL accounts (including inactive) for this page
+  const { data: allAccounts = [], isLoading: accountsLoading } = useQuery<any[]>({
+    queryKey: ["portfolio", "accounts", "all"],
+    queryFn: () => api.get("/portfolio/accounts/all").then((r) => r.data),
+  });
+
+  const { data: transactions = [], isLoading: txLoading } = useQuery({
     queryKey: ["transactions"],
-    queryFn: () => api.get("/transactions/?limit=500").then((r) => r.data),
+    queryFn: () => api.get("/transactions/?limit=1000").then((r) => r.data),
   });
 
-  const { data: accounts = [] } = useQuery<any[]>({
-    queryKey: ["portfolio", "accounts"],
-    queryFn: () => api.get("/portfolio/accounts").then((r) => r.data),
-  });
+  // Group transactions by account_id
+  const txByAccount = transactions.reduce((acc: Record<string, any[]>, txn: any) => {
+    const key = txn.account_id;
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(txn);
+    return acc;
+  }, {} as Record<string, any[]>);
 
-  const deleteMutation = useMutation({
-    mutationFn: (id: string) => api.delete(`/transactions/${id}`),
-    onSuccess: () => {
-      toast.success("Transaction deleted");
-      queryClient.invalidateQueries({ queryKey: ["transactions"] });
+  // Toggle account active/inactive
+  const toggleMutation = useMutation({
+    mutationFn: ({ id, is_active }: { id: string; is_active: boolean }) =>
+      api.patch(`/portfolio/accounts/${id}`, { is_active }).then((r) => r.data),
+    onSuccess: (data) => {
+      toast.success(data.is_active ? `${data.name} included in dashboard` : `${data.name} excluded from dashboard`);
       queryClient.invalidateQueries({ queryKey: ["portfolio"] });
     },
-    onError: () => toast.error("Failed to delete"),
+    onError: () => toast.error("Failed to update account"),
   });
 
-  const handleDelete = (id: string, symbol: string) => {
-    if (confirm(`Delete ${symbol} transaction? This cannot be undone.`)) {
-      deleteMutation.mutate(id);
+  // Remove account (soft delete)
+  const removeMutation = useMutation({
+    mutationFn: (id: string) => api.delete(`/portfolio/accounts/${id}`),
+    onSuccess: () => {
+      toast.success("Account removed");
+      queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+      queryClient.invalidateQueries({ queryKey: ["transactions"] });
+    },
+    onError: () => toast.error("Failed to remove account"),
+  });
+
+  const handleToggle = (id: string, active: boolean) => {
+    toggleMutation.mutate({ id, is_active: active });
+  };
+
+  const handleRemove = (id: string, name: string) => {
+    if (confirm(`Remove "${name}" and exclude all its transactions from calculations?\n\nThis will not delete the data — you can re-add the account later.`)) {
+      removeMutation.mutate(id);
     }
   };
 
-  // Group transactions by source/account for display
-  const txCount = transactions.length;
-  const isInflow = (t: string) => ["BUY", "TRANSFER_IN", "DEPOSIT", "STAKE_REWARD", "DIVIDEND", "DISTRIBUTION", "INTEREST"].includes(t);
+  const activeCount = allAccounts.filter((a) => a.is_active).length;
+  const totalTx = transactions.length;
+  const isLoading = accountsLoading || txLoading;
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -462,7 +638,9 @@ export default function TransactionsPage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-gray-100">Investments</h1>
-          <p className="text-sm text-gray-500 mt-0.5">{txCount} transaction{txCount !== 1 ? "s" : ""} across {accounts.length} account{accounts.length !== 1 ? "s" : ""}</p>
+          <p className="text-sm text-gray-500 mt-0.5">
+            {activeCount} of {allAccounts.length} account{allAccounts.length !== 1 ? "s" : ""} active · {totalTx} transaction{totalTx !== 1 ? "s" : ""}
+          </p>
         </div>
         <button
           onClick={() => { setShowImport(!showImport); setSelectedBroker(null); }}
@@ -489,12 +667,11 @@ export default function TransactionsPage() {
           </div>
 
           {!selectedBroker ? (
-            /* ── Broker Grid ── */
             <div>
               <p className="text-sm text-gray-400 mb-4">
                 Select your broker or exchange to get specific export instructions.
               </p>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
                 {BROKERS.map((b) => (
                   <button
                     key={b.id}
@@ -511,7 +688,6 @@ export default function TransactionsPage() {
               </div>
             </div>
           ) : (
-            /* ── Selected Broker Upload ── */
             <div>
               <button
                 onClick={() => setSelectedBroker(null)}
@@ -521,11 +697,12 @@ export default function TransactionsPage() {
               </button>
               <BrokerUploadPanel
                 broker={selectedBroker}
-                accounts={accounts}
+                accounts={allAccounts}
                 onImportDone={() => {
                   setShowImport(false);
                   setSelectedBroker(null);
-                  refetch();
+                  queryClient.invalidateQueries({ queryKey: ["transactions"] });
+                  queryClient.invalidateQueries({ queryKey: ["portfolio"] });
                 }}
               />
             </div>
@@ -533,131 +710,52 @@ export default function TransactionsPage() {
         </div>
       )}
 
-      {/* ── Transactions Table ── */}
-      <div className="card-glass">
-        <div className="p-4 border-b border-gray-800 flex items-center justify-between">
-          <span className="text-sm text-gray-400">{txCount} transactions</span>
-          <span className="text-xs text-gray-500">
-            Displaying in {displayCurrency} {displayCurrency === "AUD" ? "(RBA rates)" : ""} — toggle in top bar
+      {/* ── Info Banner ── */}
+      {allAccounts.length > 0 && (
+        <div className="flex items-start gap-2 text-xs text-gray-400 bg-gray-800/30 rounded-lg px-4 py-3 border border-gray-800">
+          <Eye className="w-3.5 h-3.5 flex-shrink-0 mt-0.5 text-blue-400" />
+          <span>
+            Use the checkboxes to include or exclude accounts from your Dashboard and Analytics calculations.
+            Transactions are displayed in their original currency. Currency conversion is applied in the Dashboard and Analytics tabs.
           </span>
         </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-xs text-gray-500 uppercase tracking-wider border-b border-gray-800">
-                <th className="text-left p-3 pl-4">Date</th>
-                <th className="text-left p-3">Type</th>
-                <th className="text-left p-3">Asset</th>
-                <th className="text-right p-3">Qty</th>
-                <th className="text-right p-3">Price</th>
-                <th className="text-right p-3">Fees</th>
-                <th className="text-right p-3">Amount</th>
-                <th className="text-center p-3">CCY</th>
-                <th className="text-left p-3">Source</th>
-                <th className="text-center p-3 pr-4 w-10"></th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-800/50">
-              {isLoading &&
-                Array.from({ length: 6 }).map((_, i) => (
-                  <tr key={i}>
-                    {Array.from({ length: 10 }).map((_, j) => (
-                      <td key={j} className="p-3">
-                        <div className="h-4 bg-gray-800 rounded animate-pulse" />
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              {!isLoading &&
-                transactions.map((txn: any) => {
-                  const typeStyle = TYPE_STYLES[txn.transaction_type] || "text-gray-400 bg-gray-400/10";
-                  const inflow = isInflow(txn.transaction_type);
-                  const wantAud = displayCurrency === "AUD";
-                  const hasAudData = txn.net_amount_aud != null || txn.price_per_unit_aud != null;
-                  const convertToAud = wantAud && txn.currency !== "AUD" && hasAudData;
+      )}
 
-                  const price = convertToAud ? txn.price_per_unit_aud : txn.price_per_unit;
-                  const fees = convertToAud && txn.fx_rate_to_aud ? txn.fees * txn.fx_rate_to_aud : txn.fees;
-                  const amount = convertToAud ? txn.net_amount_aud : txn.net_amount;
-                  const ccy = convertToAud ? "AUD" : (txn.currency || "USD");
-
-                  return (
-                    <tr key={txn.id} className="hover:bg-gray-800/30 transition-colors group">
-                      <td className="p-3 pl-4 text-gray-400 whitespace-nowrap text-xs">
-                        {formatDate(txn.transacted_at)}
-                      </td>
-                      <td className="p-3">
-                        <span className={clsx("text-xs font-medium px-2 py-0.5 rounded-full", typeStyle)}>
-                          {TYPE_LABELS[txn.transaction_type] || txn.transaction_type}
-                        </span>
-                      </td>
-                      <td className="p-3 font-medium text-gray-100 text-xs">
-                        {txn.symbol || "—"}
-                      </td>
-                      <td className="p-3 text-right font-mono text-xs">
-                        {txn.quantity != null ? (
-                          <span className={inflow ? "text-green-400" : "text-red-400"}>
-                            {inflow ? "+" : "-"}{Math.abs(txn.quantity).toLocaleString(undefined, { maximumFractionDigits: 6 })}
-                          </span>
-                        ) : "—"}
-                      </td>
-                      <td className="p-3 text-right font-mono text-gray-400 text-xs">
-                        {price ? formatInCurrency(price, ccy) : "—"}
-                      </td>
-                      <td className="p-3 text-right font-mono text-gray-500 text-xs">
-                        {fees && fees > 0 ? formatInCurrency(fees, ccy) : "—"}
-                      </td>
-                      <td className="p-3 text-right font-mono text-xs font-medium">
-                        {amount != null ? (
-                          <span className={amount >= 0 ? "text-green-400" : "text-red-400"}>
-                            {formatInCurrency(amount, ccy)}
-                          </span>
-                        ) : "—"}
-                      </td>
-                      <td className="p-3 text-center">
-                        <span className={clsx(
-                          "text-xs px-1.5 py-0.5 rounded font-medium",
-                          ccy === "AUD" ? "text-blue-400 bg-blue-400/10" :
-                          ccy === "USD" ? "text-green-400 bg-green-400/10" :
-                          "text-gray-400 bg-gray-400/10"
-                        )}>
-                          {ccy}
-                        </span>
-                      </td>
-                      <td className="p-3">
-                        <span className="text-xs text-gray-600 truncate max-w-[80px] block">
-                          {txn.source?.replace("_IMPORT", "").replace("_", " ") || "Manual"}
-                        </span>
-                      </td>
-                      <td className="p-3 pr-4 text-center">
-                        <button
-                          onClick={() => handleDelete(txn.id, txn.symbol || txn.transaction_type)}
-                          className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-red-400 transition-all p-1 rounded hover:bg-red-400/10"
-                          title="Delete transaction"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
-            </tbody>
-          </table>
-          {!isLoading && txCount === 0 && (
-            <div className="text-center py-16 space-y-3">
-              <Upload className="w-10 h-10 text-gray-700 mx-auto" />
-              <p className="text-gray-500 text-sm">No investments yet</p>
-              <button
-                onClick={() => setShowImport(true)}
-                className="btn-primary text-sm px-5 py-2"
-              >
-                <Plus className="w-4 h-4 inline mr-1.5 -mt-0.5" />
-                Add Investment
-              </button>
+      {/* ── Account Cards ── */}
+      {isLoading && (
+        <div className="space-y-4">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <div key={i} className="card-glass p-4">
+              <div className="h-12 bg-gray-800/50 rounded animate-pulse" />
             </div>
-          )}
+          ))}
         </div>
-      </div>
+      )}
+
+      {!isLoading && allAccounts.length === 0 && (
+        <div className="card-glass text-center py-16 space-y-3">
+          <Upload className="w-10 h-10 text-gray-700 mx-auto" />
+          <p className="text-gray-500 text-sm">No investment accounts yet</p>
+          <p className="text-gray-600 text-xs">Import your trade history from any supported broker to get started.</p>
+          <button
+            onClick={() => setShowImport(true)}
+            className="btn-primary text-sm px-5 py-2 mt-2"
+          >
+            <Plus className="w-4 h-4 inline mr-1.5 -mt-0.5" />
+            Add Investment
+          </button>
+        </div>
+      )}
+
+      {!isLoading && allAccounts.map((account: any) => (
+        <AccountCard
+          key={account.id}
+          account={account}
+          transactions={txByAccount[account.id] || []}
+          onToggle={handleToggle}
+          onRemove={handleRemove}
+        />
+      ))}
     </div>
   );
 }
