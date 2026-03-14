@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from shared.models import Account, Asset, Transaction
+from services.fx_service import FXService
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +275,7 @@ class TransactionImporter:
 
     def __init__(self, db: AsyncSession):
         self.db = db
+        self._fx = FXService()
 
     async def import_file(
         self,
@@ -304,9 +306,12 @@ class TransactionImporter:
         # Normalize rows using broker-specific mapping
         normalized = self._normalize_rows(rows, broker)
 
-        result = await self._process_transactions(normalized, account_id, user_id, source)
-        result.broker_detected = broker.name
-        return result
+        try:
+            result = await self._process_transactions(normalized, account_id, user_id, source)
+            result.broker_detected = broker.name
+            return result
+        finally:
+            await self._fx.close()
 
     # ─── File Parsers ────────────────────────────────────────────────────
 
@@ -610,10 +615,10 @@ class TransactionImporter:
                     else:
                         net_amount = -(net_amount + parsed.fees)
 
-                # AUD conversion — for AUD txns rate=1, for USD use approximate rate
-                fx_rate_aud = self._get_aud_rate(parsed.currency)
-                net_amount_aud = (net_amount * fx_rate_aud) if net_amount is not None else None
-                price_aud = (parsed.price * fx_rate_aud) if parsed.price is not None else None
+                # AUD conversion — uses RBA daily rates (ATO-approved)
+                fx_rate_aud = await self._fx.get_aud_rate(parsed.currency, parsed.date)
+                net_amount_aud = (net_amount * fx_rate_aud).quantize(Decimal("0.01")) if net_amount is not None else None
+                price_aud = (parsed.price * fx_rate_aud).quantize(Decimal("0.000001")) if parsed.price is not None else None
 
                 txn = Transaction(
                     account_id=account_id,
@@ -680,28 +685,6 @@ class TransactionImporter:
             await self.db.flush()
 
         return asset.id
-
-    # ─── AUD FX Rate ─────────────────────────────────────────────────────
-
-    @staticmethod
-    def _get_aud_rate(currency: str) -> Decimal:
-        """
-        Get approximate FX rate to AUD.
-        For production, this should fetch RBA daily rates.
-        Current static rates are approximate mid-market rates.
-        """
-        STATIC_RATES = {
-            "AUD": Decimal("1.0"),
-            "USD": Decimal("1.55"),   # ~1 USD = 1.55 AUD
-            "GBP": Decimal("1.95"),
-            "EUR": Decimal("1.65"),
-            "NZD": Decimal("1.08"),
-            "CAD": Decimal("1.10"),
-            "JPY": Decimal("0.0105"),
-            "HKD": Decimal("0.20"),
-            "SGD": Decimal("1.15"),
-        }
-        return STATIC_RATES.get(currency.upper(), Decimal("1.0"))
 
     # ─── Date Parsing ────────────────────────────────────────────────────
 

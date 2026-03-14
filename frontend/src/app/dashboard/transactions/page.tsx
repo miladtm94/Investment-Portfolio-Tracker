@@ -11,6 +11,7 @@ import {
 import clsx from "clsx";
 import { useDropzone } from "react-dropzone";
 import toast from "react-hot-toast";
+import { useCurrency } from "@/lib/context/CurrencyContext";
 
 // ─── Type Styles ──────────────────────────────────────────────────────────
 
@@ -422,7 +423,7 @@ function BrokerUploadPanel({
 export default function TransactionsPage() {
   const [showImport, setShowImport] = useState(false);
   const [selectedBroker, setSelectedBroker] = useState<BrokerInfo | null>(null);
-  const [displayCurrency, setDisplayCurrency] = useState<"original" | "AUD">("AUD");
+  const { displayCurrency } = useCurrency();
   const queryClient = useQueryClient();
 
   const { data: transactions = [], isLoading, refetch } = useQuery({
@@ -536,17 +537,9 @@ export default function TransactionsPage() {
       <div className="card-glass">
         <div className="p-4 border-b border-gray-800 flex items-center justify-between">
           <span className="text-sm text-gray-400">{txCount} transactions</span>
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-gray-500">Display:</span>
-            <select
-              value={displayCurrency}
-              onChange={(e) => setDisplayCurrency(e.target.value as "original" | "AUD")}
-              className="bg-gray-800 border border-gray-700 text-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:border-blue-500"
-            >
-              <option value="AUD">AUD (converted)</option>
-              <option value="original">Original currency</option>
-            </select>
-          </div>
+          <span className="text-xs text-gray-500">
+            Displaying in {displayCurrency} {displayCurrency === "AUD" ? "(RBA rates)" : ""} — toggle in top bar
+          </span>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -581,12 +574,12 @@ export default function TransactionsPage() {
                   const inflow = isInflow(txn.transaction_type);
                   const wantAud = displayCurrency === "AUD";
                   const hasAudData = txn.net_amount_aud != null || txn.price_per_unit_aud != null;
-                  const showAud = wantAud && txn.currency !== "AUD" && hasAudData;
+                  const convertToAud = wantAud && txn.currency !== "AUD" && hasAudData;
 
-                  const price = showAud ? txn.price_per_unit_aud : txn.price_per_unit;
-                  const fees = showAud && txn.fx_rate_to_aud ? txn.fees * txn.fx_rate_to_aud : txn.fees;
-                  const amount = showAud ? txn.net_amount_aud : txn.net_amount;
-                  const ccy = showAud ? "AUD" : (txn.currency || "USD");
+                  const price = convertToAud ? txn.price_per_unit_aud : txn.price_per_unit;
+                  const fees = convertToAud && txn.fx_rate_to_aud ? txn.fees * txn.fx_rate_to_aud : txn.fees;
+                  const amount = convertToAud ? txn.net_amount_aud : txn.net_amount;
+                  const ccy = convertToAud ? "AUD" : (txn.currency || "USD");
 
                   return (
                     <tr key={txn.id} className="hover:bg-gray-800/30 transition-colors group">

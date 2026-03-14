@@ -18,6 +18,7 @@ interface Holding {
 interface Props {
   holdings: Holding[];
   loading?: boolean;
+  currency?: string;
 }
 
 const ASSET_CLASS_COLORS: Record<string, string> = {
@@ -29,7 +30,7 @@ const ASSET_CLASS_COLORS: Record<string, string> = {
   CASH: "text-teal-400 bg-teal-400/10",
 };
 
-export function HoldingsTable({ holdings, loading = false }: Props) {
+export function HoldingsTable({ holdings, loading = false, currency = "AUD" }: Props) {
   if (loading) {
     return (
       <div className="space-y-2">
@@ -86,10 +87,10 @@ export function HoldingsTable({ holdings, loading = false }: Props) {
                   {h.quantity.toFixed(h.quantity < 1 ? 6 : 4)}
                 </td>
                 <td className="py-3 pr-4 text-right font-mono text-gray-400">
-                  {h.average_cost_basis ? formatCurrency(h.average_cost_basis) : "—"}
+                  {h.average_cost_basis ? formatCurrency(h.average_cost_basis, false, currency) : "—"}
                 </td>
                 <td className="py-3 pr-4 text-right font-mono font-medium text-gray-100">
-                  {h.market_value ? formatCurrency(h.market_value) : "—"}
+                  {h.market_value ? formatCurrency(h.market_value, false, currency) : "—"}
                 </td>
                 <td className="py-3 pr-4 text-right">
                   {h.weight_pct !== undefined ? (
@@ -110,7 +111,7 @@ export function HoldingsTable({ holdings, loading = false }: Props) {
                   {h.unrealized_gain !== undefined ? (
                     <div>
                       <div className={clsx("font-mono font-medium", isPositive ? "text-green-400" : "text-red-400")}>
-                        {isPositive ? "+" : ""}{formatCurrency(h.unrealized_gain)}
+                        {isPositive ? "+" : ""}{formatCurrency(h.unrealized_gain, false, currency)}
                       </div>
                       <div className={clsx("text-xs", isPositive ? "text-green-500" : "text-red-500")}>
                         {isPositive ? "+" : ""}{formatPercent(h.unrealized_gain_pct ?? 0)}

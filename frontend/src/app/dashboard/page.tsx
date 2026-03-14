@@ -11,10 +11,13 @@ import {
   TrendingUp, TrendingDown, DollarSign, Activity,
   BarChart3, Shield, Zap, ArrowUpRight
 } from "lucide-react";
+import { useCurrency } from "@/lib/context/CurrencyContext";
 
 export default function DashboardPage() {
   const { data: portfolio, isLoading: portfolioLoading } = usePortfolioSummary();
   const { data: analytics, isLoading: analyticsLoading } = useAnalytics("1Y");
+  const { displayCurrency } = useCurrency();
+  const ccy = displayCurrency;
 
   const isPositive = (portfolio?.total_unrealized_gain ?? 0) >= 0;
 
@@ -40,7 +43,7 @@ export default function DashboardPage() {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <MetricCard
           title="Total Net Worth"
-          value={portfolioLoading ? null : formatCurrency(portfolio?.total_market_value ?? 0)}
+          value={portfolioLoading ? null : formatCurrency(portfolio?.total_market_value ?? 0, false, ccy)}
           subtitle="Market Value"
           icon={<DollarSign className="w-4 h-4" />}
           loading={portfolioLoading}
@@ -48,7 +51,7 @@ export default function DashboardPage() {
         />
         <MetricCard
           title="Unrealized P&L"
-          value={portfolioLoading ? null : formatCurrency(portfolio?.total_unrealized_gain ?? 0)}
+          value={portfolioLoading ? null : formatCurrency(portfolio?.total_unrealized_gain ?? 0, false, ccy)}
           subtitle={portfolioLoading ? "" : formatPercent(portfolio?.total_unrealized_gain_pct ?? 0)}
           icon={isPositive ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
           positive={isPositive}
@@ -75,7 +78,7 @@ export default function DashboardPage() {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <MetricCard
           title="Realized Gains (ST)"
-          value={portfolioLoading ? null : formatCurrency(portfolio?.total_realized_gain_short ?? 0)}
+          value={portfolioLoading ? null : formatCurrency(portfolio?.total_realized_gain_short ?? 0, false, ccy)}
           subtitle="Short-term"
           icon={<BarChart3 className="w-4 h-4" />}
           compact
@@ -83,7 +86,7 @@ export default function DashboardPage() {
         />
         <MetricCard
           title="Realized Gains (LT)"
-          value={portfolioLoading ? null : formatCurrency(portfolio?.total_realized_gain_long ?? 0)}
+          value={portfolioLoading ? null : formatCurrency(portfolio?.total_realized_gain_long ?? 0, false, ccy)}
           subtitle="Long-term"
           icon={<BarChart3 className="w-4 h-4" />}
           compact
@@ -91,7 +94,7 @@ export default function DashboardPage() {
         />
         <MetricCard
           title="Dividend Income"
-          value={portfolioLoading ? null : formatCurrency(portfolio?.dividend_income ?? 0)}
+          value={portfolioLoading ? null : formatCurrency(portfolio?.dividend_income ?? 0, false, ccy)}
           subtitle="This year"
           icon={<Zap className="w-4 h-4" />}
           compact
@@ -99,7 +102,7 @@ export default function DashboardPage() {
         />
         <MetricCard
           title="Staking Income"
-          value={portfolioLoading ? null : formatCurrency(portfolio?.staking_income ?? 0)}
+          value={portfolioLoading ? null : formatCurrency(portfolio?.staking_income ?? 0, false, ccy)}
           subtitle="Crypto rewards"
           icon={<ArrowUpRight className="w-4 h-4" />}
           compact
@@ -110,7 +113,7 @@ export default function DashboardPage() {
       {/* Charts Row */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2">
-          <PortfolioValueChart period="1Y" />
+          <PortfolioValueChart period="1Y" currency={ccy} />
         </div>
         <div>
           <AllocationPie data={analytics?.allocation.by_asset_class} />
@@ -125,7 +128,7 @@ export default function DashboardPage() {
             View all →
           </a>
         </div>
-        <HoldingsTable holdings={portfolio?.holdings?.slice(0, 10) ?? []} loading={portfolioLoading} />
+        <HoldingsTable holdings={portfolio?.holdings?.slice(0, 10) ?? []} loading={portfolioLoading} currency={ccy} />
       </div>
     </div>
   );

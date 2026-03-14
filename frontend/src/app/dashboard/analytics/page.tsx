@@ -9,6 +9,7 @@ import { MetricCard } from "@/components/ui/MetricCard";
 import { formatPercent, formatNumber } from "@/lib/utils/formatters";
 import { Activity, Shield, TrendingUp, BarChart3 } from "lucide-react";
 import clsx from "clsx";
+import { useCurrency } from "@/lib/context/CurrencyContext";
 
 const PERIODS = ["1M", "3M", "6M", "YTD", "1Y", "3Y"] as const;
 type Period = (typeof PERIODS)[number];
@@ -16,6 +17,7 @@ type Period = (typeof PERIODS)[number];
 export default function AnalyticsPage() {
   const [period, setPeriod] = useState<Period>("1Y");
   const { data, isLoading } = useAnalytics(period);
+  const { displayCurrency } = useCurrency();
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -137,7 +139,7 @@ export default function AnalyticsPage() {
 
       {/* Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <PortfolioValueChart period={period} />
+        <PortfolioValueChart period={period} currency={displayCurrency} />
         <AllocationPie
           data={data?.allocation.by_asset_class}
           title="Asset Class Allocation"

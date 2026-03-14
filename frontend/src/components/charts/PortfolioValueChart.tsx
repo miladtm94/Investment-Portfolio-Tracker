@@ -11,23 +11,24 @@ import { TrendingUp } from "lucide-react";
 
 interface Props {
   period?: string;
+  currency?: string;
 }
 
-const CustomTooltip = ({ active, payload, label }: any) => {
+function ChartTooltip({ active, payload, label, currency = "AUD" }: any) {
   if (active && payload && payload.length) {
     return (
       <div className="bg-gray-900 border border-gray-700 rounded-lg p-3 shadow-xl">
         <p className="text-xs text-gray-400 mb-1">{label}</p>
         <p className="text-sm font-semibold text-gray-100">
-          {formatCurrency(payload[0].value)}
+          {formatCurrency(payload[0].value, false, currency)}
         </p>
       </div>
     );
   }
   return null;
-};
+}
 
-export function PortfolioValueChart({ period = "1Y" }: Props) {
+export function PortfolioValueChart({ period = "1Y", currency = "AUD" }: Props) {
   const { data, isLoading } = useQuery({
     queryKey: ["portfolio", "value-history", period],
     queryFn: () =>
@@ -52,10 +53,10 @@ export function PortfolioValueChart({ period = "1Y" }: Props) {
           </h3>
           <div className="flex items-center gap-3 mt-1">
             <span className="text-lg font-bold text-gray-100">
-              {formatCurrency(endVal)}
+              {formatCurrency(endVal, false, currency)}
             </span>
             <span className={`text-sm font-medium ${isPositive ? "text-green-400" : "text-red-400"}`}>
-              {isPositive ? "+" : ""}{formatCurrency(change)} ({isPositive ? "+" : ""}{changePct}%)
+              {isPositive ? "+" : ""}{formatCurrency(change, false, currency)} ({isPositive ? "+" : ""}{changePct}%)
             </span>
           </div>
         </div>
@@ -93,7 +94,7 @@ export function PortfolioValueChart({ period = "1Y" }: Props) {
               tickFormatter={(v) => `$${(v / 1000).toFixed(0)}k`}
               width={50}
             />
-            <Tooltip content={<CustomTooltip />} />
+            <Tooltip content={<ChartTooltip currency={currency} />} />
             <Area
               type="monotone"
               dataKey="value"
