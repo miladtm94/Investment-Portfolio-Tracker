@@ -171,8 +171,11 @@ export default function TransactionsPage() {
           headers: { "Content-Type": "multipart/form-data" },
         });
         const result = resp.data;
+        const brokerLabel = result.broker_detected && result.broker_detected !== "Unknown"
+          ? ` (${result.broker_detected})`
+          : "";
         toast.success(
-          `Imported ${result.imported} transaction${result.imported !== 1 ? "s" : ""}` +
+          `Imported ${result.imported} transaction${result.imported !== 1 ? "s" : ""}${brokerLabel}` +
           (result.duplicates ? ` · ${result.duplicates} duplicates skipped` : "") +
           (result.errors ? ` · ${result.errors} errors` : ""),
           { id: toastId, duration: 5000 }

@@ -56,6 +56,7 @@ class ImportResultResponse(BaseModel):
     errors: int
     error_details: list[str]
     transaction_ids: list[str]
+    broker_detected: str = "Unknown"
 
 
 @router.get("/", response_model=list[TransactionResponse])
@@ -227,4 +228,5 @@ async def import_transactions(
         errors=result.errors,
         error_details=result.error_details[:20],
         transaction_ids=result.transactions,
+        broker_detected=result.broker_detected,
     )

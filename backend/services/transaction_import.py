@@ -2,7 +2,19 @@
 Transaction Import Engine.
 
 Parses CSV/Excel/JSON exports from brokers and exchanges,
-normalizes to canonical schema, and deduplicates against existing records.
+auto-detects broker format, normalizes to canonical schema,
+and deduplicates against existing records.
+
+Supported brokers:
+  - CommSec (ASX)           — AUD trades, "B"/"S" type codes
+  - CMC Invest (ASX)        — AUD trades, "Buy"/"Sell"
+  - Stake (US equities)     — USD trades with FX column
+  - Moomoo (US equities)    — USD trades with commission
+  - Interactive Brokers      — Flex Query CSV export (wide format)
+  - Kraken (crypto)         — "pair" column with txid
+  - Coinbase (crypto)       — "Spot Price" column
+  - Robinhood / Schwab / Fidelity — standard US broker format
+  - Generic CSV             — auto-mapped via fuzzy column matching
 """
 from __future__ import annotations
 
@@ -11,7 +23,8 @@ import hashlib
 import io
 import json
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Optional
@@ -26,14 +39,13 @@ logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
 
-CANONICAL_FIELDS = [
-    "date", "type", "symbol", "quantity", "price",
-    "fees", "currency", "amount", "exchange", "notes",
-]
+
+# ─── Type Aliases ────────────────────────────────────────────────────────────
 
 TYPE_ALIASES = {
     # Buys
     "buy": "BUY", "bought": "BUY", "purchase": "BUY", "b": "BUY",
+    "exchtrade": "BUY",  # IBKR — determined by quantity sign
     # Sells
     "sell": "SELL", "sold": "SELL", "s": "SELL",
     # Dividends
@@ -51,6 +63,174 @@ TYPE_ALIASES = {
 }
 
 
+# ─── Broker Detection ────────────────────────────────────────────────────────
+
+@dataclass
+class BrokerProfile:
+    """Configuration for a specific broker's CSV format."""
+    name: str
+    default_currency: str
+    column_map: dict[str, str]   # {canonical_field: exact_column_name}
+    type_field: str = "type"
+    symbol_cleanup: Optional[str] = None  # regex to strip from symbols
+    quantity_signed: bool = False  # IBKR uses negative qty for sells
+    date_format: Optional[str] = None
+
+
+# Broker signatures: {frozenset_of_lowercase_columns: BrokerProfile}
+BROKER_SIGNATURES: list[tuple[set[str], BrokerProfile]] = [
+    # CommSec — has "Security Code" and "Brokerage ($)"
+    (
+        {"security code", "brokerage ($)"},
+        BrokerProfile(
+            name="CommSec",
+            default_currency="AUD",
+            column_map={
+                "date": "Date",
+                "type": "Type",
+                "symbol": "Security Code",
+                "quantity": "Quantity",
+                "price": "Price ($)",
+                "fees": "Brokerage ($)",
+                "net_amount": "Net Proceeds ($)",
+                "notes": "Security Description",
+            },
+            date_format="%d/%m/%Y",
+        ),
+    ),
+
+    # CMC Invest — has "Stock Code" and "Brokerage"
+    (
+        {"stock code", "brokerage"},
+        BrokerProfile(
+            name="CMC Invest",
+            default_currency="AUD",
+            column_map={
+                "date": "Date",
+                "type": "Type",
+                "symbol": "Stock Code",
+                "quantity": "Quantity",
+                "price": "Price",
+                "fees": "Brokerage",
+                "net_amount": "Net Amount",
+                "currency": "Currency",
+                "notes": "Stock Name",
+            },
+            date_format="%d/%m/%Y",
+        ),
+    ),
+
+    # IBKR Flex Query — has "TradePrice" and "IBCommission"
+    (
+        {"tradeprice", "ibcommission"},
+        BrokerProfile(
+            name="Interactive Brokers",
+            default_currency="USD",
+            column_map={
+                "date": "TradeDate",
+                "type": "TransactionType",
+                "symbol": "Symbol",
+                "quantity": "Quantity",
+                "price": "TradePrice",
+                "fees": "IBCommission",
+                "net_amount": "NetCash",
+                "currency": "CurrencyPrimary",
+                "notes": "Description",
+            },
+            quantity_signed=True,  # negative qty = sell
+            date_format="%Y%m%d",
+        ),
+    ),
+
+    # Stake — has "Side" and "Brokerage" and "FX Rate"
+    (
+        {"side", "fx rate"},
+        BrokerProfile(
+            name="Stake",
+            default_currency="USD",
+            column_map={
+                "date": "Trade Date",
+                "type": "Side",
+                "symbol": "Symbol",
+                "quantity": "Quantity",
+                "price": "Price",
+                "fees": "Brokerage",
+                "currency": "Currency",
+                "net_amount": "Total (USD)",
+                "notes": "Market",
+            },
+        ),
+    ),
+
+    # Moomoo — has "Side" and "Platform Fee"
+    (
+        {"side", "platform fee"},
+        BrokerProfile(
+            name="Moomoo",
+            default_currency="USD",
+            column_map={
+                "date": "Date",
+                "type": "Side",
+                "symbol": "Symbol",
+                "quantity": "Quantity",
+                "price": "Price",
+                "fees": "Commission",
+                "net_amount": "Amount",
+                "currency": "Currency",
+                "notes": "Name",
+            },
+        ),
+    ),
+
+    # Kraken — has "pair" and "txid" and "vol"
+    (
+        {"pair", "txid", "vol"},
+        BrokerProfile(
+            name="Kraken",
+            default_currency="USD",
+            column_map={
+                "date": "time",
+                "type": "type",
+                "symbol": "pair",
+                "quantity": "vol",
+                "price": "price",
+                "fees": "fee",
+                "net_amount": "cost",
+            },
+            symbol_cleanup=r"^X{1,2}|Z?USD$|ZUSD$",  # XXBTZUSD -> BTC
+        ),
+    ),
+
+    # Coinbase — has "Spot Price at Transaction"
+    (
+        {"spot price at transaction"},
+        BrokerProfile(
+            name="Coinbase",
+            default_currency="USD",
+            column_map={
+                "date": "Timestamp",
+                "type": "Transaction Type",
+                "symbol": "Asset",
+                "quantity": "Quantity Transacted",
+                "price": "Spot Price at Transaction",
+                "fees": "Fees and/or Spread",
+                "net_amount": "Total (inclusive of fees and/or spread)",
+                "currency": "Spot Price Currency",
+                "notes": "Notes",
+            },
+        ),
+    ),
+]
+
+# Kraken symbol map: exchange symbol -> canonical symbol
+KRAKEN_SYMBOLS = {
+    "XXBT": "BTC", "XETH": "ETH", "XXRP": "XRP", "XLTC": "LTC",
+    "XXLM": "XLM", "XDAO": "DAO", "XXDG": "DOGE",
+    "SOL": "SOL", "LINK": "LINK", "DOT": "DOT", "ADA": "ADA",
+    "AVAX": "AVAX", "MATIC": "MATIC", "UNI": "UNI", "ATOM": "ATOM",
+}
+
+
 @dataclass
 class ParsedTransaction:
     """A normalized transaction ready for deduplication and insertion."""
@@ -65,6 +245,7 @@ class ParsedTransaction:
     notes: Optional[str]
     raw_row: dict
     import_hash: str
+    broker: str = "Unknown"
 
 
 @dataclass
@@ -76,11 +257,12 @@ class ImportResult:
     errors: int
     error_details: list[str]
     transactions: list[str]  # IDs of imported transactions
+    broker_detected: str = "Unknown"
 
 
 class TransactionImporter:
     """
-    Multi-format transaction importer with automatic schema detection.
+    Multi-format transaction importer with automatic broker detection.
     """
 
     def __init__(self, db: AsyncSession):
@@ -94,9 +276,6 @@ class TransactionImporter:
         user_id: str,
         source: str = "CSV_IMPORT",
     ) -> ImportResult:
-        """
-        Auto-detect file format and import transactions.
-        """
         ext = file_name.lower().split(".")[-1]
 
         if ext in ("csv", "txt"):
@@ -108,18 +287,24 @@ class TransactionImporter:
         else:
             return ImportResult(0, 0, 0, 1, [f"Unsupported file format: {ext}"], [])
 
-        # Normalize and detect schema
-        normalized = self._normalize_rows(rows)
+        if not rows:
+            return ImportResult(0, 0, 0, 1, ["No data rows found in file"], [])
 
-        # Deduplicate and insert
-        return await self._process_transactions(normalized, account_id, user_id, source)
+        # Detect broker from column headers
+        broker = self._detect_broker(rows[0])
+        logger.info(f"Detected broker: {broker.name} ({len(rows)} rows)")
+
+        # Normalize rows using broker-specific mapping
+        normalized = self._normalize_rows(rows, broker)
+
+        result = await self._process_transactions(normalized, account_id, user_id, source)
+        result.broker_detected = broker.name
+        return result
+
+    # ─── File Parsers ────────────────────────────────────────────────────
 
     def _parse_csv(self, content: bytes) -> list[dict]:
-        """
-        Parse CSV with automatic delimiter detection.
-        Falls back gracefully for files with metadata rows before the header
-        (e.g. CommSec, Stake exports).
-        """
+        """Parse CSV with encoding detection, metadata skipping, dialect sniffing."""
         for encoding in ("utf-8-sig", "utf-8", "latin-1"):
             try:
                 text = content.decode(encoding)
@@ -131,17 +316,16 @@ class TransactionImporter:
 
         lines = text.splitlines()
 
-        # Find the first line that looks like a real header:
-        # has multiple comma/tab/semicolon-separated tokens and no leading digits
+        # Skip metadata/preamble: find first line with 3+ comma-separated tokens
+        # where the first token is not purely numeric
         header_idx = 0
         for i, line in enumerate(lines):
             stripped = line.strip()
             if not stripped:
                 continue
-            # A data/header line has at least 2 delimited tokens
             for delim in (",", "\t", ";"):
-                parts = stripped.split(delim)
-                if len(parts) >= 2 and not parts[0].strip().lstrip("-").replace(".", "").isdigit():
+                parts = [p.strip().strip('"') for p in stripped.split(delim)]
+                if len(parts) >= 3 and not parts[0].lstrip("-").replace(".", "").isdigit():
                     header_idx = i
                     break
             else:
@@ -150,125 +334,199 @@ class TransactionImporter:
 
         clean_text = "\n".join(lines[header_idx:])
 
-        # Try sniffer first, fall back to comma
         try:
-            dialect = csv.Sniffer().sniff(clean_text[:4096], delimiters=",;\t")
+            dialect = csv.Sniffer().sniff(clean_text[:8192], delimiters=",;\t")
         except csv.Error:
-            dialect = csv.excel  # plain comma
+            dialect = csv.excel
 
         reader = csv.DictReader(io.StringIO(clean_text), dialect=dialect)
         return [dict(row) for row in reader if any(v and str(v).strip() for v in row.values())]
 
     def _parse_excel(self, content: bytes) -> list[dict]:
-        """Parse Excel file."""
         df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
         df = df.dropna(how="all")
         return df.to_dict(orient="records")
 
     def _parse_json(self, content: bytes) -> list[dict]:
-        """Parse JSON export."""
         data = json.loads(content)
         if isinstance(data, list):
             return data
-        # Try to find the records array
         for key in ("transactions", "trades", "history", "records", "data"):
             if key in data and isinstance(data[key], list):
                 return data[key]
         return [data]
 
-    def _normalize_rows(self, rows: list[dict]) -> list[ParsedTransaction]:
-        """
-        Detect field mapping and normalize each row to canonical schema.
-        """
-        if not rows:
-            return []
+    # ─── Broker Detection ────────────────────────────────────────────────
 
-        # Auto-detect column mapping
-        mapping = self._detect_schema(rows[0])
+    def _detect_broker(self, sample_row: dict) -> BrokerProfile:
+        """Identify broker from column names in the first row."""
+        cols_lower = {k.lower().strip() for k in sample_row.keys()}
+
+        for signature_cols, profile in BROKER_SIGNATURES:
+            if signature_cols.issubset(cols_lower):
+                # Verify column_map keys actually exist (case-insensitive)
+                return self._resolve_column_casing(profile, sample_row)
+
+        # Fallback: generic fuzzy mapping
+        return self._build_generic_profile(sample_row)
+
+    def _resolve_column_casing(self, profile: BrokerProfile, sample_row: dict) -> BrokerProfile:
+        """Match profile's expected columns to actual casing in the file."""
+        actual_keys = list(sample_row.keys())
+        lower_to_actual = {k.lower().strip(): k for k in actual_keys}
+
+        resolved_map = {}
+        for canonical, expected_col in profile.column_map.items():
+            actual = lower_to_actual.get(expected_col.lower().strip())
+            if actual:
+                resolved_map[canonical] = actual
+            else:
+                # Fuzzy fallback for this field
+                for actual_key in actual_keys:
+                    if expected_col.lower() in actual_key.lower() or actual_key.lower() in expected_col.lower():
+                        resolved_map[canonical] = actual_key
+                        break
+
+        return BrokerProfile(
+            name=profile.name,
+            default_currency=profile.default_currency,
+            column_map=resolved_map,
+            type_field=profile.type_field,
+            symbol_cleanup=profile.symbol_cleanup,
+            quantity_signed=profile.quantity_signed,
+            date_format=profile.date_format,
+        )
+
+    def _build_generic_profile(self, sample_row: dict) -> BrokerProfile:
+        """Build a generic broker profile using fuzzy column matching."""
+        PATTERNS = {
+            "date": ["date", "time", "datetime", "trade date", "transaction date", "timestamp", "settled"],
+            "type": ["type", "transaction type", "action", "transaction", "side", "order type"],
+            "symbol": ["symbol", "ticker", "asset", "coin", "instrument", "security", "stock code"],
+            "quantity": ["quantity", "qty", "shares", "units", "size", "filled qty", "vol"],
+            "price": ["price", "price per share", "unit price", "fill price", "avg price", "trade price", "spot price"],
+            "fees": ["fees", "fee", "commission", "brokerage", "charges", "comm"],
+            "currency": ["currency", "ccy", "quote currency", "currency primary"],
+            "net_amount": ["net amount", "total", "net", "proceeds", "value", "subtotal", "consideration", "net cash", "cost"],
+            "notes": ["notes", "description", "memo", "comment", "details", "reference", "name"],
+        }
+
+        keys = list(sample_row.keys())
+        keys_lower = [k.lower().strip() for k in keys]
+        mapping = {}
+        used_keys = set()
+
+        for canonical, patterns in PATTERNS.items():
+            for pattern in patterns:
+                for idx, kl in enumerate(keys_lower):
+                    if keys[idx] not in used_keys and (pattern == kl or pattern in kl or kl in pattern):
+                        # Avoid mapping "amount" to both "quantity" and "net_amount"
+                        if canonical == "quantity" and ("net" in kl or "total" in kl or "proceed" in kl):
+                            continue
+                        mapping[canonical] = keys[idx]
+                        used_keys.add(keys[idx])
+                        break
+                if canonical in mapping:
+                    break
+
+        # Guess currency from column names
+        currency = "USD"
+        for k in keys_lower:
+            if "aud" in k or "($)" in k:
+                currency = "AUD"
+                break
+
+        return BrokerProfile(
+            name="Auto-detected",
+            default_currency=currency,
+            column_map=mapping,
+        )
+
+    # ─── Normalization ───────────────────────────────────────────────────
+
+    def _normalize_rows(self, rows: list[dict], broker: BrokerProfile) -> list[ParsedTransaction]:
         normalized = []
-
         for i, row in enumerate(rows):
             try:
-                txn = self._normalize_row(row, mapping)
+                txn = self._normalize_row(row, broker)
                 if txn:
                     normalized.append(txn)
             except Exception as e:
                 logger.warning(f"Row {i}: parse error: {e} — row: {row}")
-
         return normalized
 
-    def _detect_schema(self, sample_row: dict) -> dict[str, str]:
-        """
-        Map source columns to canonical field names using fuzzy matching.
-        Returns: {canonical_field: source_column}
-        """
-        COLUMN_PATTERNS = {
-            "date": ["date", "time", "datetime", "trade date", "transaction date", "timestamp", "settled"],
-            "type": ["type", "transaction type", "action", "transaction", "side", "order type"],
-            "symbol": ["symbol", "ticker", "asset", "coin", "currency", "instrument", "security"],
-            "quantity": ["quantity", "qty", "amount", "shares", "units", "size", "filled qty"],
-            "price": ["price", "price per share", "unit price", "fill price", "avg price", "rate"],
-            "fees": ["fees", "fee", "commission", "cost", "charges", "brokerage"],
-            "currency": ["currency", "ccy", "quote currency"],
-            "net_amount": ["net amount", "total", "net", "proceeds", "value", "subtotal", "consideration"],
-            "notes": ["notes", "description", "memo", "comment", "details", "reference"],
-        }
-
-        keys = [k.lower().strip() for k in sample_row.keys()]
-        mapping = {}
-
-        for canonical, patterns in COLUMN_PATTERNS.items():
-            for pattern in patterns:
-                matches = [k for k in keys if pattern in k or k in pattern]
-                if matches:
-                    # Find original casing
-                    original_keys = list(sample_row.keys())
-                    for orig in original_keys:
-                        if orig.lower().strip() == matches[0]:
-                            mapping[canonical] = orig
-                            break
-                    break
-
-        return mapping
-
-    def _normalize_row(self, row: dict, mapping: dict[str, str]) -> Optional[ParsedTransaction]:
-        """Normalize a single row to canonical schema."""
+    def _normalize_row(self, row: dict, broker: BrokerProfile) -> Optional[ParsedTransaction]:
+        """Normalize a single row using the broker profile."""
+        col_map = broker.column_map
 
         def get(field: str, default=None):
-            col = mapping.get(field)
+            col = col_map.get(field)
             if col and col in row:
                 v = row[col]
-                return str(v).strip() if v is not None and str(v).strip() != "" else default
+                if v is not None and str(v).strip() != "":
+                    return str(v).strip()
             return default
 
-        # Date
+        # ── Date ──
         date_str = get("date")
         if not date_str:
             return None
-        txn_date = self._parse_date(date_str)
+
+        if broker.date_format:
+            txn_date = self._parse_date_with_format(date_str, broker.date_format)
+        else:
+            txn_date = self._parse_date(date_str)
         if not txn_date:
             return None
 
-        # Type
+        # ── Quantity (parse early — IBKR uses sign for buy/sell) ──
+        quantity = self._parse_decimal(get("quantity"))
+
+        # ── Type ──
         type_raw = (get("type") or "BUY").lower().strip()
         txn_type = TYPE_ALIASES.get(type_raw, type_raw.upper())
 
-        # Symbol
+        # IBKR: negative quantity = sell
+        if broker.quantity_signed and quantity is not None:
+            if quantity < 0:
+                txn_type = "SELL"
+                quantity = abs(quantity)
+            else:
+                txn_type = "BUY"
+
+        # ── Symbol ──
         symbol = get("symbol", "")
         if not symbol:
             return None
-        symbol = symbol.upper().strip().replace("-USD", "").replace("/USD", "")
+        symbol = symbol.upper().strip()
 
-        # Numeric fields
-        quantity = self._parse_decimal(get("quantity"))
+        # Kraken pair cleanup: XXBTZUSD -> BTC
+        if broker.name == "Kraken":
+            symbol = self._clean_kraken_symbol(symbol)
+        else:
+            # Generic cleanup
+            symbol = symbol.replace("-USD", "").replace("/USD", "").replace(".AX", "")
+
+        if not symbol:
+            return None
+
+        # ── Numeric fields ──
         price = self._parse_decimal(get("price"))
         fees = self._parse_decimal(get("fees")) or ZERO
+        # IBKR reports commission as negative
+        fees = abs(fees)
         net_amount = self._parse_decimal(get("net_amount"))
 
-        currency = (get("currency") or "USD").upper()[:3]
+        # ── Currency ──
+        currency = (get("currency") or broker.default_currency).upper()
+        # Normalize to 3-char ISO code
+        if len(currency) > 3:
+            currency = currency[:3]
+
+        # ── Notes ──
         notes = get("notes")
 
-        # Compute import hash for deduplication
+        # ── Import hash ──
         hash_input = f"{txn_date.date()}|{txn_type}|{symbol}|{quantity}|{price}|{fees}"
         import_hash = hashlib.sha256(hash_input.encode()).hexdigest()
 
@@ -284,7 +542,24 @@ class TransactionImporter:
             notes=notes,
             raw_row=row,
             import_hash=import_hash,
+            broker=broker.name,
         )
+
+    # ─── Symbol Cleanup ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _clean_kraken_symbol(pair: str) -> str:
+        """Convert Kraken pair to canonical symbol: XXBTZUSD -> BTC, XETHZUSD -> ETH."""
+        pair = pair.upper()
+        # Remove quote currency suffix
+        for suffix in ("ZUSD", "USD", "ZEUR", "EUR", "ZAUD", "AUD"):
+            if pair.endswith(suffix):
+                base = pair[: -len(suffix)]
+                return KRAKEN_SYMBOLS.get(base, base.lstrip("X"))
+        # If no quote currency found, just return as-is
+        return KRAKEN_SYMBOLS.get(pair, pair)
+
+    # ─── Database Operations ─────────────────────────────────────────────
 
     async def _process_transactions(
         self,
@@ -293,14 +568,12 @@ class TransactionImporter:
         user_id: str,
         source: str,
     ) -> ImportResult:
-        """Deduplicate and insert transactions into the database."""
         imported = 0
         duplicates = 0
         errors = 0
         error_details = []
         imported_ids = []
 
-        # Fetch account to validate
         account_result = await self.db.execute(
             select(Account).where(Account.id == account_id, Account.user_id == user_id)
         )
@@ -308,9 +581,10 @@ class TransactionImporter:
         if not account:
             return ImportResult(len(normalized), 0, 0, 1, ["Account not found"], [])
 
+        broker_name = normalized[0].broker if normalized else "Unknown"
+
         for parsed in normalized:
             try:
-                # Check for duplicate via import_hash
                 existing = await self.db.execute(
                     select(Transaction).where(Transaction.import_hash == parsed.import_hash)
                 )
@@ -318,10 +592,8 @@ class TransactionImporter:
                     duplicates += 1
                     continue
 
-                # Resolve or create asset
-                asset_id = await self._resolve_asset(parsed.symbol)
+                asset_id = await self._resolve_asset(parsed.symbol, parsed.currency)
 
-                # Compute net amount if not provided
                 net_amount = parsed.net_amount
                 if net_amount is None and parsed.quantity and parsed.price:
                     qty = abs(parsed.quantity)
@@ -354,7 +626,7 @@ class TransactionImporter:
 
             except Exception as e:
                 errors += 1
-                error_details.append(f"Row error: {e}")
+                error_details.append(f"Row error ({parsed.symbol}): {e}")
                 logger.error(f"Import error for {parsed.symbol}: {e}")
 
         await self.db.commit()
@@ -366,45 +638,63 @@ class TransactionImporter:
             errors=errors,
             error_details=error_details,
             transactions=imported_ids,
+            broker_detected=broker_name,
         )
 
-    async def _resolve_asset(self, symbol: str) -> Optional[str]:
-        """Look up or create an asset record."""
+    async def _resolve_asset(self, symbol: str, currency: str = "USD") -> Optional[str]:
         result = await self.db.execute(
             select(Asset).where(Asset.symbol == symbol)
         )
         asset = result.scalar_one_or_none()
 
         if not asset:
-            # Infer asset class from symbol
-            CRYPTO_SYMBOLS = {"BTC", "ETH", "SOL", "USDT", "USDC", "BNB", "XRP", "ADA", "MATIC", "LINK", "DOT", "AVAX"}
+            CRYPTO_SYMBOLS = {
+                "BTC", "ETH", "SOL", "USDT", "USDC", "BNB", "XRP", "ADA",
+                "MATIC", "LINK", "DOT", "AVAX", "DOGE", "LTC", "UNI", "ATOM",
+                "XLM", "ALGO", "FIL", "AAVE", "NEAR", "OP", "ARB",
+            }
             asset_class = "CRYPTO" if symbol in CRYPTO_SYMBOLS else "EQUITY"
 
             asset = Asset(
                 symbol=symbol,
                 name=symbol,
                 asset_class=asset_class,
-                currency="USD",
+                currency=currency,
             )
             self.db.add(asset)
             await self.db.flush()
 
         return asset.id
 
+    # ─── Date Parsing ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_date_with_format(value: str, fmt: str) -> Optional[datetime]:
+        """Parse date with a known format, then fallback to generic."""
+        from datetime import timezone
+        try:
+            dt = datetime.strptime(value.split(".")[0].strip(), fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            return TransactionImporter._parse_date(value)
+
     @staticmethod
     def _parse_date(value: str) -> Optional[datetime]:
-        """Try multiple date formats."""
+        from datetime import timezone
         formats = [
-            "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y",
+            "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y",
             "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ",
-            "%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S",
-            "%d-%m-%Y", "%b %d, %Y", "%B %d, %Y",
+            "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S",
+            "%d/%m/%Y %H:%M:%S", "%d-%m-%Y",
+            "%Y%m%d",  # IBKR compact
+            "%b %d, %Y", "%B %d, %Y",
         ]
         for fmt in formats:
             try:
                 dt = datetime.strptime(value.split(".")[0].strip(), fmt)
                 if dt.tzinfo is None:
-                    from datetime import timezone
                     dt = dt.replace(tzinfo=timezone.utc)
                 return dt
             except ValueError:
@@ -415,10 +705,12 @@ class TransactionImporter:
     def _parse_decimal(value: Optional[str]) -> Optional[Decimal]:
         if not value:
             return None
-        # Remove currency symbols, commas, parentheses (negative)
         cleaned = value.replace(",", "").replace("$", "").replace("£", "").replace("€", "").strip()
         is_negative = cleaned.startswith("(") and cleaned.endswith(")")
         cleaned = cleaned.strip("()")
+        # Handle trailing minus (some brokers)
+        if cleaned.endswith("-"):
+            cleaned = "-" + cleaned[:-1]
         try:
             d = Decimal(cleaned)
             return -d if is_negative else d
