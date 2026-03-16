@@ -35,6 +35,9 @@ env/
 postgres_data/
 redis_data/
 
+# Local data samples
+samples/
+
 # Logs
 *.log
 logs/

@@ -1,9 +1,0 @@
-Date,Type,Stock Code,Stock Name,Quantity,Price,Brokerage,Net Amount,Currency
-15/02/2024,Buy,CBA,Commonwealth Bank of Australia,50,98.50,11.00,4936.00,AUD
-01/03/2024,Buy,BHP,BHP Group Ltd,100,45.20,11.00,4531.00,AUD
-15/03/2024,Buy,CSL,CSL Ltd,20,285.00,11.00,5711.00,AUD
-10/04/2024,Buy,WES,Wesfarmers Ltd,30,62.50,11.00,1886.00,AUD
-20/05/2024,Buy,NAB,National Australia Bank Ltd,150,33.80,11.00,5081.00,AUD
-15/09/2024,Sell,BHP,BHP Group Ltd,50,48.90,11.00,2434.00,AUD
-20/11/2024,Buy,FMG,Fortescue Ltd,80,20.15,11.00,1623.00,AUD
-10/01/2025,Sell,WES,Wesfarmers Ltd,30,71.20,11.00,2125.00,AUD
