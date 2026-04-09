@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     claude_model: str = "claude-opus-4-6"
     claude_max_tokens: int = 4096
 
+    # OpenAI
+    openai_api_key: SecretStr = SecretStr("")
+    openai_model: str = "gpt-4o"
+
+    # Google Gemini
+    gemini_api_key: SecretStr = SecretStr("")
+    gemini_model: str = "gemini-1.5-flash"  # free tier model
+
     # ─── Market Data ──────────────────────────────────────────────────────
     polygon_api_key: SecretStr = SecretStr("")
     coingecko_api_key: SecretStr = SecretStr("")

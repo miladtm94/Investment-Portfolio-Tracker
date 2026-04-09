@@ -7,8 +7,8 @@ import { TrendingUp, Mail, Lock, User, Loader2 } from "lucide-react";
 export default function LoginPage() {
   const { login, register } = useAuth();
   const [isRegister, setIsRegister] = useState(false);
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
+  const [email, setEmail] = useState("demo@investiq.io");
+  const [password, setPassword] = useState("demo1234");
   const [fullName, setFullName] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);

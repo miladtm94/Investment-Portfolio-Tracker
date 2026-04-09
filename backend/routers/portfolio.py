@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from database import get_db
-from shared.models import Account, User
+from shared.models import Account, Transaction, User
 from shared.auth import get_current_user
 from shared.cache import cache_invalidate_user
 from services.portfolio_engine import PortfolioEngine, HoldingSnapshot, PortfolioSummary
@@ -64,6 +64,7 @@ class HoldingResponse(BaseModel):
     unrealized_gain: Optional[float]
     unrealized_gain_pct: Optional[float]
     currency: str
+    original_currency: str = "AUD"  # Asset's native trading currency
 
 
 class PortfolioSummaryResponse(BaseModel):
@@ -96,6 +97,7 @@ def _to_holding_response(h: HoldingSnapshot, total_mv: Decimal) -> HoldingRespon
         unrealized_gain=float(h.unrealized_gain) if h.unrealized_gain else None,
         unrealized_gain_pct=float(h.unrealized_gain_pct) if h.unrealized_gain_pct else None,
         currency=h.currency,
+        original_currency=getattr(h, 'original_currency', h.currency),
     )
 
 
@@ -199,7 +201,13 @@ async def delete_account(
     account = result.scalar_one_or_none()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
-    account.is_active = False
+    # Hard delete: remove all transactions first, then the account
+    await db.execute(
+        select(Transaction).where(Transaction.account_id == account_id)
+    )
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(Transaction).where(Transaction.account_id == account_id))
+    await db.delete(account)
     await db.commit()
     await cache_invalidate_user(current_user.id)
 
@@ -210,6 +218,7 @@ async def delete_account(
 async def get_portfolio_summary(
     account_ids: Optional[list[str]] = Query(None),
     as_of: Optional[datetime] = Query(None),
+    currency: Optional[str] = Query(None, description="Display currency (AUD|USD)"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -241,8 +250,11 @@ async def get_portfolio_summary(
         account_ids=account_ids,
         as_of=as_of,
         cost_basis_method=current_user.cost_basis_method,
+        display_currency=currency.upper() if currency else "AUD",
     )
-    return _to_summary_response(summary)
+    result = _to_summary_response(summary)
+
+    return result
 
 
 @router.get("/accounts/{account_id}/holdings", response_model=list[HoldingResponse])
@@ -265,6 +277,7 @@ async def get_account_holdings(
 
 @router.get("/net-worth")
 async def get_net_worth(
+    currency: Optional[str] = Query(None, description="Display currency (AUD|USD)"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -278,10 +291,12 @@ async def get_net_worth(
     active_ids = [row[0] for row in active_result.all()]
 
     engine = _get_engine(db)
+    display_ccy = currency.upper() if currency else "AUD"
     summary = await engine.get_portfolio_summary(
         user_id=current_user.id,
         account_ids=active_ids or None,
         cost_basis_method=current_user.cost_basis_method,
+        display_currency=display_ccy,
     )
 
     by_class: dict[str, float] = {}
@@ -293,6 +308,6 @@ async def get_net_worth(
         "total_net_worth": float(summary.total_market_value),
         "by_asset_class": by_class,
         "total_unrealized_gain": float(summary.total_unrealized_gain),
-        "currency": current_user.preferred_currency,
+        "currency": display_ccy,
         "as_of": summary.as_of.isoformat(),
     }

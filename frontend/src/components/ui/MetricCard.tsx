@@ -12,6 +12,8 @@ interface MetricCardProps {
   loading?: boolean;
   compact?: boolean;
   accent?: "blue" | "green" | "red" | "yellow" | "none";
+  /** Highlight the value (e.g. when currency toggle is active) */
+  highlighted?: boolean;
 }
 
 export function MetricCard({
@@ -23,6 +25,7 @@ export function MetricCard({
   loading = false,
   compact = false,
   accent = "none",
+  highlighted = false,
 }: MetricCardProps) {
   const accentColors: Record<string, string> = {
     blue: "border-blue-500/30 bg-blue-500/5",
@@ -58,9 +61,10 @@ export function MetricCard({
           <div className={clsx(
             "font-bold font-mono",
             compact ? "text-lg" : "text-2xl",
-            positive === true ? "text-green-400" :
-            positive === false ? "text-red-400" :
-            "text-gray-100"
+            positive === true ? "text-green-400"
+            : positive === false ? "text-red-400"
+            : highlighted ? "text-blue-300"
+            : "text-gray-100"
           )}>
             {value ?? "—"}
           </div>

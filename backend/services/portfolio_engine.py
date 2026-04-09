@@ -20,11 +20,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from shared.models import Account, Asset, Holding, TaxLot, Transaction, User
 from shared.cache import cache_get, cache_set
 from services.market_data_service import MarketDataService
+from services.fx_service import FXService
 
 logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
 PREC = Decimal("0.0000000001")
+
+
+def _norm_ccy(code: Optional[str]) -> str:
+    return FXService._normalize_currency(code or "USD")
 
 
 @dataclass
@@ -36,10 +41,20 @@ class Lot:
     quantity_remaining: Decimal
     cost_basis_per_unit: Decimal
     currency: str = "USD"
+    fx_rate_to_aud: Optional[Decimal] = None
 
     @property
     def total_cost_basis(self) -> Decimal:
         return (self.quantity_remaining * self.cost_basis_per_unit).quantize(PREC, rounding=ROUND_HALF_EVEN)
+
+
+@dataclass
+class FxEvent:
+    """A dated cashflow or gain in original currency."""
+    occurred_at: datetime
+    currency: str
+    amount: Decimal
+    kind: str  # dividend|staking|realized_short|realized_long
 
 
 @dataclass
@@ -50,12 +65,15 @@ class PortfolioState:
     lots: dict[str, list[Lot]] = field(default_factory=dict)
     # asset_id → total quantity (derived from lots)
     quantities: dict[str, Decimal] = field(default_factory=dict)
-    # Realized gains
+    # Realized gains (in original currencies — converted at display time)
     realized_gain_short: Decimal = ZERO
     realized_gain_long: Decimal = ZERO
+    realized_gains_by_currency: dict[str, dict[str, Decimal]] = field(default_factory=dict)
     # Income
     dividend_income: Decimal = ZERO
     staking_income: Decimal = ZERO
+    income_by_currency: dict[str, dict[str, Decimal]] = field(default_factory=dict)
+    fx_events: list[FxEvent] = field(default_factory=list)
 
     def quantity(self, asset_id: str) -> Decimal:
         return self.quantities.get(asset_id, ZERO)
@@ -87,7 +105,8 @@ class HoldingSnapshot:
     market_value: Optional[Decimal]
     unrealized_gain: Optional[Decimal]
     unrealized_gain_pct: Optional[Decimal]
-    currency: str = "USD"
+    currency: str = "AUD"
+    original_currency: str = "AUD"  # The asset's native trading currency
 
 
 @dataclass
@@ -125,6 +144,7 @@ class PortfolioEngine:
         account_ids: Optional[list[str]] = None,
         as_of: Optional[datetime] = None,
         cost_basis_method: str = "FIFO",
+        display_currency: str = "AUD",
     ) -> PortfolioSummary:
         """
         Reconstruct and return a full portfolio summary with live prices.
@@ -132,13 +152,16 @@ class PortfolioEngine:
         if as_of is None:
             as_of = datetime.now(timezone.utc)
 
-        cache_key = f"portfolio:{user_id}:summary:{as_of.date()}"
+        # Include account_ids in cache key so different account combos don't collide
+        acc_hash = hashlib.md5(",".join(sorted(account_ids or [])).encode()).hexdigest()[:8] if account_ids else "all"
+        display_ccy = _norm_ccy(display_currency)
+        cache_key = f"portfolio:{user_id}:summary:{as_of.date()}:{acc_hash}:{display_ccy}"
         cached = await cache_get(cache_key)
         if cached and as_of.date() < datetime.now(timezone.utc).date():
             return PortfolioSummary(**cached)
 
         state = await self._reconstruct_state(user_id, account_ids, as_of, cost_basis_method)
-        summary = await self._hydrate_with_prices(state, user_id)
+        summary = await self._hydrate_with_prices(state, user_id, display_ccy)
 
         if as_of.date() < datetime.now(timezone.utc).date():
             await cache_set(cache_key, self._serialize_summary(summary), ttl=3600)
@@ -222,7 +245,7 @@ class PortfolioEngine:
             return self._apply_sell(state, txn, asset, cost_basis_method)
         elif t == "SPLIT":
             return self._apply_split(state, txn, asset)
-        elif t == "DIVIDEND":
+        elif t in ("DIVIDEND", "DISTRIBUTION"):
             return self._apply_dividend(state, txn, asset)
         elif t in ("STAKE_REWARD", "STAKING_REWARD"):
             return self._apply_stake_reward(state, txn, asset)
@@ -244,10 +267,9 @@ class PortfolioEngine:
 
         asset_id = txn.asset_id
         quantity = Decimal(str(txn.quantity))
+        ccy = _norm_ccy(txn.currency)
         price = Decimal(str(txn.price_per_unit))
-
-        # Include fees in cost basis (IRS requires this for stocks)
-        fees = Decimal(str(txn.fees or 0))
+        fees = abs(Decimal(str(txn.fees or 0)))
         cost_per_unit = ((quantity * price + fees) / quantity).quantize(PREC)
 
         new_lot = Lot(
@@ -256,7 +278,8 @@ class PortfolioEngine:
             acquired_at=txn.transacted_at,
             quantity_remaining=quantity,
             cost_basis_per_unit=cost_per_unit,
-            currency=txn.currency or "USD",
+            currency=ccy,
+            fx_rate_to_aud=Decimal(str(txn.fx_rate_to_aud)) if txn.fx_rate_to_aud else (Decimal("1.0") if ccy == "AUD" else None),
         )
 
         if asset_id not in state.lots:
@@ -278,8 +301,11 @@ class PortfolioEngine:
 
         asset_id = txn.asset_id
         quantity_to_sell = abs(Decimal(str(txn.quantity)))
+
+        ccy = _norm_ccy(txn.currency)
         proceeds_per_unit = Decimal(str(txn.price_per_unit or 0))
-        proceeds = quantity_to_sell * proceeds_per_unit - Decimal(str(txn.fees or 0))
+        fees = abs(Decimal(str(txn.fees or 0)))
+        proceeds = quantity_to_sell * proceeds_per_unit - fees
 
         lots = state.lots.get(asset_id, [])
         if not lots:
@@ -296,7 +322,11 @@ class PortfolioEngine:
 
             sell_qty = min(lot.quantity_remaining, remaining_to_sell)
             lot_proceeds = sell_qty * proceeds_per_unit
-            lot_cost = sell_qty * lot.cost_basis_per_unit
+            if lot.currency != ccy:
+                # Fallback: treat mismatched currency as same via normalized mapping
+                lot_cost = sell_qty * lot.cost_basis_per_unit
+            else:
+                lot_cost = sell_qty * lot.cost_basis_per_unit
             lot_gain = lot_proceeds - lot_cost
 
             # Determine short/long term (>= 365 days = long term)
@@ -305,8 +335,10 @@ class PortfolioEngine:
 
             if is_long_term:
                 state.realized_gain_long += lot_gain
+                state.fx_events.append(FxEvent(txn.transacted_at, ccy, lot_gain, "realized_long"))
             else:
                 state.realized_gain_short += lot_gain
+                state.fx_events.append(FxEvent(txn.transacted_at, ccy, lot_gain, "realized_short"))
 
             lot.quantity_remaining -= sell_qty
             remaining_to_sell -= sell_qty
@@ -335,9 +367,19 @@ class PortfolioEngine:
         return state
 
     def _apply_dividend(self, state: PortfolioState, txn: Transaction, asset: Optional[Asset]) -> PortfolioState:
-        """Cash dividend — record as income, no lot impact."""
-        if txn.net_amount_usd:
-            state.dividend_income += Decimal(str(txn.net_amount_usd))
+        """Cash dividend — record as income in original currency, no lot impact."""
+        amount = ZERO
+        if txn.net_amount:
+            amount = abs(Decimal(str(txn.net_amount)))
+        elif txn.net_amount_usd:
+            amount = Decimal(str(txn.net_amount_usd))
+
+        ccy = _norm_ccy(txn.currency)
+        if ccy not in state.income_by_currency:
+            state.income_by_currency[ccy] = {"dividend": ZERO, "staking": ZERO}
+        state.income_by_currency[ccy]["dividend"] += amount
+        state.dividend_income += amount  # kept for backwards compat (will be overridden)
+        state.fx_events.append(FxEvent(txn.transacted_at, ccy, amount, "dividend"))
         return state
 
     def _apply_stake_reward(self, state: PortfolioState, txn: Transaction, asset: Optional[Asset]) -> PortfolioState:
@@ -348,9 +390,15 @@ class PortfolioEngine:
         if not asset or not txn.quantity:
             return state
 
-        state.staking_income += Decimal(str(txn.net_amount_usd or 0))
+        amount = Decimal(str(txn.net_amount or txn.net_amount_usd or 0))
+        ccy = _norm_ccy(txn.currency)
+        if ccy not in state.income_by_currency:
+            state.income_by_currency[ccy] = {"dividend": ZERO, "staking": ZERO}
+        state.income_by_currency[ccy]["staking"] += amount
+        state.staking_income += amount
+        state.fx_events.append(FxEvent(txn.transacted_at, ccy, amount, "staking"))
 
-        # Create lot at FMV (price_per_unit at time of receipt)
+        # Create lot at FMV — keep original currency
         asset_id = txn.asset_id
         quantity = Decimal(str(txn.quantity))
         price = Decimal(str(txn.price_per_unit or 0))
@@ -361,6 +409,8 @@ class PortfolioEngine:
             acquired_at=txn.transacted_at,
             quantity_remaining=quantity,
             cost_basis_per_unit=price,
+            currency=ccy,
+            fx_rate_to_aud=Decimal(str(txn.fx_rate_to_aud)) if txn.fx_rate_to_aud else (Decimal("1.0") if ccy == "AUD" else None),
         )
         if asset_id not in state.lots:
             state.lots[asset_id] = []
@@ -376,6 +426,7 @@ class PortfolioEngine:
 
         asset_id = txn.asset_id
         quantity = Decimal(str(txn.quantity))
+        ccy = _norm_ccy(txn.currency)
         price = Decimal(str(txn.price_per_unit or 0))
 
         lot = Lot(
@@ -384,6 +435,8 @@ class PortfolioEngine:
             acquired_at=txn.transacted_at,
             quantity_remaining=quantity,
             cost_basis_per_unit=price,
+            currency=ccy,
+            fx_rate_to_aud=Decimal(str(txn.fx_rate_to_aud)) if txn.fx_rate_to_aud else (Decimal("1.0") if ccy == "AUD" else None),
         )
         if asset_id not in state.lots:
             state.lots[asset_id] = []
@@ -449,9 +502,13 @@ class PortfolioEngine:
 
     # ─── Price Hydration ─────────────────────────────────────────────────
 
-    async def _hydrate_with_prices(self, state: PortfolioState, user_id: str) -> PortfolioSummary:
-        """Fetch current prices and compute market values."""
-        # Collect all asset IDs with non-zero positions
+    async def _hydrate_with_prices(self, state: PortfolioState, user_id: str, display_currency: str) -> PortfolioSummary:
+        """Fetch current prices and compute market values.
+
+        Cost basis is kept in the asset's original currency.
+        Market prices are fetched in the asset's trading currency.
+        Everything is then converted to display currency for the summary using FX rates.
+        """
         asset_ids = [aid for aid, qty in state.quantities.items() if qty > ZERO]
         if not asset_ids:
             return PortfolioSummary(
@@ -469,9 +526,78 @@ class PortfolioEngine:
         result = await self.db.execute(select(Asset).where(Asset.id.in_(asset_ids)))
         assets = {a.id: a for a in result.scalars()}
 
-        # Fetch prices (one call to market data service)
+        # Fetch prices — pass currency so ASX stocks use .AX suffix
         symbols = [assets[aid].symbol for aid in asset_ids if aid in assets]
-        prices = await self.market_data.get_batch_prices(symbols)
+        symbol_currencies = {
+            assets[aid].symbol: (assets[aid].currency or "USD")
+            for aid in asset_ids if aid in assets
+        }
+        prices = await self.market_data.get_batch_prices(symbols, symbol_currencies)
+
+        target_ccy = _norm_ccy(display_currency)
+
+        # Current FX rates for market prices → display currency
+        spot_currencies = {
+            _norm_ccy(assets[aid].currency or "USD")
+            for aid in asset_ids
+            if aid in assets and _norm_ccy(assets[aid].currency or "USD") != target_ccy
+        }
+
+        fx = None
+        spot_rates: dict[str, Decimal] = {}  # 1 foreign = X target_ccy
+        if spot_currencies:
+            fx = FXService()
+            for ccy in spot_currencies:
+                spot_rates[ccy] = await fx.get_rate_on_date(ccy, target_ccy, state.as_of)
+
+        # Historical FX rates for cost basis + cashflows
+        fx_rate_cache: dict[tuple[str, str, str], Decimal] = {}
+        fx_requests: set[tuple[str, str, str]] = set()
+
+        for asset_id in asset_ids:
+            for lot in state.open_lots(asset_id):
+                from_ccy = _norm_ccy(lot.currency)
+                if from_ccy == target_ccy:
+                    continue
+                if target_ccy == "AUD" and lot.fx_rate_to_aud:
+                    continue
+                day = lot.acquired_at.date().isoformat()
+                fx_requests.add((from_ccy, target_ccy, day))
+
+        for ev in state.fx_events:
+            from_ccy = _norm_ccy(ev.currency)
+            if from_ccy == target_ccy:
+                continue
+            day = ev.occurred_at.date().isoformat()
+            fx_requests.add((from_ccy, target_ccy, day))
+
+        if fx_requests and not fx:
+            fx = FXService()
+
+        if fx_requests:
+            for from_c, to_c, day in fx_requests:
+                dt = datetime.fromisoformat(day).replace(tzinfo=timezone.utc)
+                fx_rate_cache[(from_c, to_c, day)] = await fx.get_rate_on_date(from_c, to_c, dt)
+
+        if fx:
+            await fx.close()
+
+        def lot_to_display(cost_per_unit: Decimal, lot: Lot) -> Decimal:
+            from_ccy = _norm_ccy(lot.currency)
+            if from_ccy == target_ccy:
+                return cost_per_unit
+            if target_ccy == "AUD" and lot.fx_rate_to_aud:
+                return (cost_per_unit * lot.fx_rate_to_aud).quantize(PREC)
+            key = (from_ccy, target_ccy, lot.acquired_at.date().isoformat())
+            rate = fx_rate_cache.get(key, Decimal("1"))
+            return (cost_per_unit * rate).quantize(PREC)
+
+        def spot_to_display(amount: Decimal, ccy: str) -> Decimal:
+            from_ccy = _norm_ccy(ccy)
+            if from_ccy == target_ccy:
+                return amount
+            rate = spot_rates.get(from_ccy, Decimal("1"))
+            return (amount * rate).quantize(PREC)
 
         holdings: list[HoldingSnapshot] = []
         total_market_value = ZERO
@@ -483,23 +609,31 @@ class PortfolioEngine:
                 continue
 
             asset = assets[asset_id]
-            cost_basis = state.total_cost_basis(asset_id)
-            avg_cost = state.avg_cost_basis(asset_id)
+            asset_ccy = _norm_ccy(asset.currency or "USD")
+
+            # Cost basis — convert each lot using historical FX for display currency
+            cost_basis_display = ZERO
+            for lot in state.open_lots(asset_id):
+                cost_basis_display += (lot.quantity_remaining * lot_to_display(lot.cost_basis_per_unit, lot)).quantize(PREC)
+            avg_cost_display = (cost_basis_display / qty).quantize(PREC) if qty > ZERO else None
 
             price = prices.get(asset.symbol)
-            market_value = None
+            market_value_aud = None
             unrealized_gain = None
             unrealized_gain_pct = None
+            price_aud = None
 
             if price is not None:
                 price_dec = Decimal(str(price))
-                market_value = (qty * price_dec).quantize(PREC)
-                unrealized_gain = market_value - cost_basis
-                if cost_basis > ZERO:
-                    unrealized_gain_pct = (unrealized_gain / cost_basis * 100).quantize(Decimal("0.01"))
+                # Market price in asset's trading currency → convert to display currency with current rate
+                price_aud = spot_to_display(price_dec, asset_ccy).quantize(Decimal("0.000001"))
+                market_value_aud = (qty * price_aud).quantize(PREC)
+                unrealized_gain = market_value_aud - cost_basis_display
+                if cost_basis_display > ZERO:
+                    unrealized_gain_pct = (unrealized_gain / cost_basis_display * 100).quantize(Decimal("0.01"))
 
-                total_market_value += market_value
-                total_cost_basis += cost_basis
+                total_market_value += market_value_aud
+                total_cost_basis += cost_basis_display
 
             holdings.append(HoldingSnapshot(
                 asset_id=asset_id,
@@ -507,13 +641,14 @@ class PortfolioEngine:
                 name=asset.name,
                 asset_class=asset.asset_class,
                 quantity=qty,
-                average_cost_basis=avg_cost,
-                total_cost_basis=cost_basis,
-                last_price=Decimal(str(price)) if price else None,
-                market_value=market_value,
+                average_cost_basis=avg_cost_display,
+                total_cost_basis=cost_basis_display,
+                last_price=price_aud,
+                market_value=market_value_aud,
                 unrealized_gain=unrealized_gain,
                 unrealized_gain_pct=unrealized_gain_pct,
-                currency=asset.currency,
+                currency=target_ccy,
+                original_currency=asset_ccy,
             ))
 
         total_unrealized = total_market_value - total_cost_basis
@@ -522,15 +657,44 @@ class PortfolioEngine:
             if total_cost_basis > ZERO else ZERO
         )
 
+        # Convert income + realized gains to display currency using historical FX
+        dividend_aud = ZERO
+        staking_aud = ZERO
+        realized_short = ZERO
+        realized_long = ZERO
+        if state.fx_events:
+            for ev in state.fx_events:
+                from_ccy = _norm_ccy(ev.currency)
+                if from_ccy == target_ccy:
+                    converted = ev.amount
+                else:
+                    key = (from_ccy, target_ccy, ev.occurred_at.date().isoformat())
+                    rate = fx_rate_cache.get(key, Decimal("1"))
+                    converted = (ev.amount * rate).quantize(PREC)
+                if ev.kind == "dividend":
+                    dividend_aud += converted
+                elif ev.kind == "staking":
+                    staking_aud += converted
+                elif ev.kind == "realized_short":
+                    realized_short += converted
+                elif ev.kind == "realized_long":
+                    realized_long += converted
+        else:
+            # Fallback for older data
+            dividend_aud = state.dividend_income
+            staking_aud = state.staking_income
+            realized_short = state.realized_gain_short
+            realized_long = state.realized_gain_long
+
         return PortfolioSummary(
             total_market_value=total_market_value,
             total_cost_basis=total_cost_basis,
             total_unrealized_gain=total_unrealized,
             total_unrealized_gain_pct=total_unrealized_pct,
-            total_realized_gain_short=state.realized_gain_short,
-            total_realized_gain_long=state.realized_gain_long,
-            dividend_income=state.dividend_income,
-            staking_income=state.staking_income,
+            total_realized_gain_short=realized_short,
+            total_realized_gain_long=realized_long,
+            dividend_income=dividend_aud,
+            staking_income=staking_aud,
             holdings=sorted(holdings, key=lambda h: -(h.market_value or ZERO)),
             as_of=state.as_of,
         )

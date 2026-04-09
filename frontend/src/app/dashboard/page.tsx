@@ -14,10 +14,11 @@ import {
 import { useCurrency } from "@/lib/context/CurrencyContext";
 
 export default function DashboardPage() {
-  const { data: portfolio, isLoading: portfolioLoading } = usePortfolioSummary();
-  const { data: analytics, isLoading: analyticsLoading } = useAnalytics("1Y");
   const { displayCurrency } = useCurrency();
   const ccy = displayCurrency;
+  const isToggled = ccy !== "AUD";
+  const { data: portfolio, isLoading: portfolioLoading } = usePortfolioSummary(undefined, ccy);
+  const { data: analytics, isLoading: analyticsLoading } = useAnalytics("1Y", "SPY", ccy);
 
   const isPositive = (portfolio?.total_unrealized_gain ?? 0) >= 0;
 
@@ -48,6 +49,7 @@ export default function DashboardPage() {
           icon={<DollarSign className="w-4 h-4" />}
           loading={portfolioLoading}
           accent="blue"
+          highlighted={isToggled}
         />
         <MetricCard
           title="Unrealized P&L"
@@ -56,6 +58,7 @@ export default function DashboardPage() {
           icon={isPositive ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
           positive={isPositive}
           loading={portfolioLoading}
+          highlighted={isToggled}
         />
         <MetricCard
           title="Annual Return"
@@ -83,6 +86,7 @@ export default function DashboardPage() {
           icon={<BarChart3 className="w-4 h-4" />}
           compact
           loading={portfolioLoading}
+          highlighted={isToggled}
         />
         <MetricCard
           title="Realized Gains (LT)"
@@ -91,6 +95,7 @@ export default function DashboardPage() {
           icon={<BarChart3 className="w-4 h-4" />}
           compact
           loading={portfolioLoading}
+          highlighted={isToggled}
         />
         <MetricCard
           title="Dividend Income"
@@ -99,6 +104,7 @@ export default function DashboardPage() {
           icon={<Zap className="w-4 h-4" />}
           compact
           loading={portfolioLoading}
+          highlighted={isToggled}
         />
         <MetricCard
           title="Staking Income"
@@ -107,13 +113,14 @@ export default function DashboardPage() {
           icon={<ArrowUpRight className="w-4 h-4" />}
           compact
           loading={portfolioLoading}
+          highlighted={isToggled}
         />
       </div>
 
       {/* Charts Row */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2">
-          <PortfolioValueChart period="1Y" currency={ccy} />
+          <PortfolioValueChart currency={ccy} />
         </div>
         <div>
           <AllocationPie data={analytics?.allocation.by_asset_class} />
@@ -124,11 +131,8 @@ export default function DashboardPage() {
       <div className="card-glass p-6">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold text-gray-100">Holdings</h2>
-          <a href="/dashboard/holdings" className="text-sm text-blue-400 hover:text-blue-300">
-            View all →
-          </a>
         </div>
-        <HoldingsTable holdings={portfolio?.holdings?.slice(0, 10) ?? []} loading={portfolioLoading} currency={ccy} />
+        <HoldingsTable holdings={portfolio?.holdings ?? []} loading={portfolioLoading} currency={ccy} />
       </div>
     </div>
   );

@@ -38,11 +38,17 @@ class TransactionResponse(BaseModel):
     quantity: Optional[float]
     price_per_unit: Optional[float]
     fees: float
+    gross_amount: Optional[float] = None
+    tax_withheld: Optional[float] = None
+    dividend_per_share: Optional[float] = None
     net_amount: Optional[float]
     currency: str
     fx_rate_to_aud: Optional[float] = None
     net_amount_aud: Optional[float] = None
     price_per_unit_aud: Optional[float] = None
+    ex_date: Optional[datetime] = None
+    franking_pct: Optional[float] = None
+    franking_credit: Optional[float] = None
     transacted_at: datetime
     source: str
     notes: Optional[str]
@@ -107,11 +113,17 @@ async def list_transactions(
             quantity=float(txn.quantity) if txn.quantity else None,
             price_per_unit=float(txn.price_per_unit) if txn.price_per_unit else None,
             fees=float(txn.fees or 0),
+            gross_amount=float(txn.gross_amount) if txn.gross_amount else None,
+            tax_withheld=float(txn.tax_withheld) if txn.tax_withheld else None,
+            dividend_per_share=float(txn.dividend_per_share) if txn.dividend_per_share else None,
             net_amount=float(txn.net_amount) if txn.net_amount else None,
             currency=txn.currency,
             fx_rate_to_aud=float(txn.fx_rate_to_aud) if txn.fx_rate_to_aud else None,
             net_amount_aud=float(txn.net_amount_aud) if txn.net_amount_aud else None,
             price_per_unit_aud=float(txn.price_per_unit_aud) if txn.price_per_unit_aud else None,
+            ex_date=txn.ex_date,
+            franking_pct=float(txn.franking_pct) if txn.franking_pct else None,
+            franking_credit=float(txn.franking_credit) if txn.franking_credit else None,
             transacted_at=txn.transacted_at,
             source=txn.source,
             notes=txn.notes,

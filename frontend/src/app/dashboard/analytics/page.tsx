@@ -16,8 +16,8 @@ type Period = (typeof PERIODS)[number];
 
 export default function AnalyticsPage() {
   const [period, setPeriod] = useState<Period>("1Y");
-  const { data, isLoading } = useAnalytics(period);
   const { displayCurrency } = useCurrency();
+  const { data, isLoading } = useAnalytics(period, "SPY", displayCurrency);
 
   return (
     <div className="space-y-6 animate-fade-in">

@@ -47,11 +47,12 @@ export interface AnalyticsBundle {
   benchmark: string;
 }
 
-export function useAnalytics(period: string = "1Y", benchmark: string = "SPY") {
+export function useAnalytics(period: string = "1Y", benchmark: string = "SPY", currency: string = "AUD") {
+  const ccyParam = currency && currency !== "AUD" ? `&currency=${currency}` : "";
   return useQuery<AnalyticsBundle>({
-    queryKey: ["analytics", period, benchmark],
+    queryKey: ["analytics", period, benchmark, currency],
     queryFn: () =>
-      api.get(`/analytics/?period=${period}&benchmark=${benchmark}`).then((r) => r.data),
-    staleTime: 5 * 60 * 1000, // 5 minutes
+      api.get(`/analytics/?period=${period}&benchmark=${benchmark}${ccyParam}`).then((r) => r.data),
+    staleTime: 5 * 60 * 1000,
   });
 }

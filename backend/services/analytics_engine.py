@@ -18,6 +18,7 @@ from scipy import optimize
 
 from services.market_data_service import MarketDataService
 from services.portfolio_engine import PortfolioEngine, PortfolioSummary
+from services.fx_service import FXService
 
 logger = logging.getLogger(__name__)
 
@@ -87,14 +88,23 @@ class AnalyticsEngine:
         period: str = "1Y",  # 1M|3M|6M|YTD|1Y|3Y|ALL
         benchmark_symbol: str = "SPY",
         cost_basis_method: str = "FIFO",
+        account_ids: list[str] | None = None,
+        display_currency: str = "AUD",
     ) -> AnalyticsBundle:
         start, end = self._period_to_dates(period)
 
         # Get current portfolio snapshot
-        current = await self.portfolio_engine.get_portfolio_summary(user_id=user_id, cost_basis_method=cost_basis_method)
+        current = await self.portfolio_engine.get_portfolio_summary(
+            user_id=user_id,
+            account_ids=account_ids,
+            cost_basis_method=cost_basis_method,
+            display_currency=display_currency,
+        )
 
         # Build portfolio return series
-        portfolio_series = await self._build_portfolio_series(user_id, start, end)
+        portfolio_series = await self._build_portfolio_series(
+            user_id, start, end, account_ids, display_currency=display_currency
+        )
         benchmark_series = await self._build_benchmark_series(benchmark_symbol, start, end)
 
         performance = self._compute_performance(portfolio_series, benchmark_series, current)
@@ -320,41 +330,71 @@ class AnalyticsEngine:
     # ─── Time Series Builders ─────────────────────────────────────────────
 
     async def _build_portfolio_series(
-        self, user_id: str, start: datetime, end: datetime
+        self, user_id: str, start: datetime, end: datetime,
+        account_ids: list[str] | None = None,
+        display_currency: str = "AUD",
     ) -> pd.Series:
         """
         Build daily portfolio value series.
         For now, reconstruct at current prices — a full implementation
         would replay the portfolio daily.
         """
-        current = await self.portfolio_engine.get_portfolio_summary(user_id=user_id)
+        current = await self.portfolio_engine.get_portfolio_summary(
+            user_id=user_id, account_ids=account_ids, display_currency=display_currency,
+        )
         if not current.holdings:
             return pd.Series(dtype=float)
 
-        # Build series from first holding's history
-        symbols = [h.symbol for h in current.holdings[:5]]  # Top 5 for performance
+        # Build price history for all holdings with market value
+        symbols = [h.symbol for h in current.holdings if h.market_value]
         all_prices: dict[str, list[dict]] = {}
 
+        logger.info(f"Building portfolio series for {len(symbols)} symbols from {start.date()} to {end.date()}")
         for sym in symbols:
-            prices = await self.market_data.get_historical_prices(sym, start, end)
-            if prices:
-                all_prices[sym] = prices
+            try:
+                prices = await self.market_data.get_historical_prices(sym, start, end)
+                if prices:
+                    all_prices[sym] = prices
+                else:
+                    logger.warning(f"No historical prices returned for {sym}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch history for {sym}: {e}")
 
         if not all_prices:
+            logger.warning("No historical price data available for any holding")
             return pd.Series(dtype=float)
 
         # Build DataFrame of prices
         frames = []
+        display_ccy = FXService._normalize_currency(display_currency)
+        fx = FXService()
+        fx_cache: dict[tuple[str, str, str], float] = {}
+
         for sym, prices in all_prices.items():
             df = pd.DataFrame(prices)
             df["date"] = pd.to_datetime(df["date"])
             df = df.set_index("date")[["close"]].rename(columns={"close": sym})
+            sym_ccy = FXService._normalize_currency(
+                next((h.original_currency for h in current.holdings if h.symbol == sym), "USD")
+            )
+            if sym_ccy != display_ccy:
+                unique_days = df.index.date
+                for day in pd.unique(unique_days):
+                    key = (sym_ccy, display_ccy, day.isoformat())
+                    if key not in fx_cache:
+                        dt = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+                        rate = await fx.get_rate_on_date(sym_ccy, display_ccy, dt)
+                        fx_cache[key] = float(rate)
+                df[sym] = df.apply(
+                    lambda r: r[sym] * fx_cache[(sym_ccy, display_ccy, r.name.date().isoformat())], axis=1
+                )
             frames.append(df)
 
         if not frames:
+            await fx.close()
             return pd.Series(dtype=float)
 
-        price_df = pd.concat(frames, axis=1).fillna(method="ffill")
+        price_df = pd.concat(frames, axis=1).ffill()
 
         # Weight by current holdings
         weights: dict[str, float] = {}
@@ -370,6 +410,7 @@ class AnalyticsEngine:
                 normalized = price_df[sym] / price_df[sym].iloc[-1]
                 portfolio_values += normalized * w * total_mv
 
+        await fx.close()
         return portfolio_values.dropna()
 
     async def _build_benchmark_series(self, symbol: str, start: datetime, end: datetime) -> pd.Series:
@@ -393,5 +434,6 @@ class AnalyticsEngine:
             case "1Y": start = now - timedelta(days=365)
             case "3Y": start = now - timedelta(days=365 * 3)
             case "5Y": start = now - timedelta(days=365 * 5)
+            case "ALL": start = now - timedelta(days=365 * 20)  # 20 years back
             case _: start = now - timedelta(days=365)
         return start, end

@@ -51,6 +51,14 @@ class FXService:
         self._http = httpx.AsyncClient(timeout=15.0)
         self._session_cache: dict[str, Decimal] = {}
 
+    @staticmethod
+    def _normalize_currency(code: str) -> str:
+        """Map stablecoins to USD for FX conversion."""
+        c = code.upper()
+        if c in {"USDT", "USDC", "DAI", "BUSD"}:
+            return "USD"
+        return c
+
     async def get_rate_on_date(
         self,
         from_currency: str,
@@ -64,8 +72,8 @@ class FXService:
         if on_date is None:
             on_date = datetime.now(timezone.utc)
 
-        from_c = from_currency.upper()
-        to_c = to_currency.upper()
+        from_c = self._normalize_currency(from_currency)
+        to_c = self._normalize_currency(to_currency)
 
         if from_c == to_c:
             return Decimal("1.0")
@@ -99,7 +107,7 @@ class FXService:
         How many AUD does 1 unit of foreign_currency cost?
         e.g. get_aud_rate("USD") → ~1.55 (1 USD = 1.55 AUD)
         """
-        if foreign_currency.upper() == "AUD":
+        if self._normalize_currency(foreign_currency) == "AUD":
             return Decimal("1.0")
         return await self.get_rate_on_date(foreign_currency, "AUD", on_date)
 

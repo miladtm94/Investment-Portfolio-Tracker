@@ -6,7 +6,7 @@ import { api } from "@/lib/api/client";
 import { formatCurrency, formatDate } from "@/lib/utils/formatters";
 import {
   Plus, Upload, X, ChevronDown, ChevronRight, Trash2,
-  FileText, AlertTriangle, Eye, EyeOff,
+  FileText, AlertTriangle, Eye, EyeOff, Key, RefreshCw, Loader2, Check,
 } from "lucide-react";
 import clsx from "clsx";
 import { useDropzone } from "react-dropzone";
@@ -52,6 +52,9 @@ interface BrokerInfo {
   instructions: string[];
   fileTypes: string;
   notes?: string;
+  supportsApiSync?: boolean;
+  apiProvider?: string;  // provider name for /sync/connect/exchange
+  apiInstructions?: string[];
 }
 
 const BROKERS: BrokerInfo[] = [
@@ -128,10 +131,13 @@ const BROKERS: BrokerInfo[] = [
     country: "AU",
     currency: "USD",
     instructions: [
-      "Login to your Moomoo app or desktop client",
-      "Go to Trade > History or Order History",
-      "Select the date range for your trades",
-      "Export or download as CSV",
+      "Login to your Moomoo account",
+      "Select Account on the left navigation bar (bottom bar on mobile)",
+      "Select More if using the mobile app",
+      "Select Tax Documents",
+      "Select Sync to Sharesight, then select Manual Import",
+      "Select the date range to cover all trading history",
+      "Click Download",
       "Upload your file below",
     ],
     fileTypes: "CSV",
@@ -150,15 +156,19 @@ const BROKERS: BrokerInfo[] = [
       "Upload your file below",
     ],
     fileTypes: "CSV",
+    supportsApiSync: true,
+    apiProvider: "KRAKEN",
+    apiInstructions: [
+      "Login to your Kraken Pro account",
+      "Go to Settings > API",
+      "Click Generate New Key and give it a name (e.g. InvestIQ)",
+      "Under Funds permissions: enable Query",
+      "Under Orders and trades: enable Query closed orders & trades",
+      "Under Data: enable Query ledger entries",
+      "Do NOT enable Deposit, Withdraw, Create/Modify/Cancel orders",
+      "Click Generate key, then copy your API Key and Private Key below",
+    ],
   },
-];
-
-// ─── Account Types ────────────────────────────────────────────────────────
-
-const ACCOUNT_TYPES = [
-  { value: "BROKERAGE", label: "Brokerage" },
-  { value: "CRYPTO_EXCHANGE", label: "Crypto Exchange" },
-  { value: "WALLET", label: "Crypto Wallet" },
 ];
 
 // ─── Currency Display ─────────────────────────────────────────────────────
@@ -173,73 +183,6 @@ function formatInCurrency(value: number | null | undefined, currency: string = "
   }).format(Math.abs(value));
 }
 
-// ─── Create Account Form ──────────────────────────────────────────────────
-
-function CreateAccountForm({ broker, onCreated }: { broker?: BrokerInfo; onCreated: () => void }) {
-  const [name, setName] = useState(broker ? `${broker.label}` : "");
-  const [type, setType] = useState(
-    broker?.id === "kraken" ? "CRYPTO_EXCHANGE" : "BROKERAGE"
-  );
-  const [currency, setCurrency] = useState(broker?.currency || "AUD");
-  const queryClient = useQueryClient();
-
-  const { mutate, isPending } = useMutation({
-    mutationFn: () =>
-      api.post("/portfolio/accounts", {
-        name,
-        institution_name: broker?.label || undefined,
-        account_type: type,
-        currency,
-      }).then((r) => r.data),
-    onSuccess: () => {
-      toast.success("Account created");
-      queryClient.invalidateQueries({ queryKey: ["portfolio"] });
-      onCreated();
-    },
-    onError: () => toast.error("Failed to create account"),
-  });
-
-  return (
-    <div className="bg-gray-800/40 rounded-lg p-4 border border-gray-700/50 space-y-3">
-      <p className="text-sm font-medium text-gray-300">Quick-create account</p>
-      <div className="grid grid-cols-3 gap-3">
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="Account name"
-          className="bg-gray-900 border border-gray-700 text-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-        />
-        <select
-          value={type}
-          onChange={(e) => setType(e.target.value)}
-          className="bg-gray-900 border border-gray-700 text-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-        >
-          {ACCOUNT_TYPES.map((t) => (
-            <option key={t.value} value={t.value}>{t.label}</option>
-          ))}
-        </select>
-        <select
-          value={currency}
-          onChange={(e) => setCurrency(e.target.value)}
-          className="bg-gray-900 border border-gray-700 text-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-        >
-          <option value="AUD">AUD</option>
-          <option value="USD">USD</option>
-          <option value="GBP">GBP</option>
-          <option value="EUR">EUR</option>
-        </select>
-      </div>
-      <button
-        onClick={() => mutate()}
-        disabled={!name || isPending}
-        className="btn-primary text-sm px-4 py-1.5 disabled:opacity-40"
-      >
-        {isPending ? "Creating…" : "Create Account"}
-      </button>
-    </div>
-  );
-}
-
 // ─── Broker Upload Panel ──────────────────────────────────────────────────
 
 function BrokerUploadPanel({
@@ -251,10 +194,35 @@ function BrokerUploadPanel({
   accounts: any[];
   onImportDone: () => void;
 }) {
-  const [accountId, setAccountId] = useState("");
-  const [showCreate, setShowCreate] = useState(false);
   const [showInstructions, setShowInstructions] = useState(true);
+  const [isCreating, setIsCreating] = useState(false);
   const queryClient = useQueryClient();
+
+  // Find or auto-create account for this broker
+  const existingAccount = accounts.find(
+    (a: any) => a.institution_name === broker.label || a.name === broker.label
+  );
+
+  const getOrCreateAccountId = async (): Promise<string | null> => {
+    if (existingAccount) return existingAccount.id;
+
+    setIsCreating(true);
+    try {
+      const resp = await api.post("/portfolio/accounts", {
+        name: broker.label,
+        institution_name: broker.label,
+        account_type: broker.id === "kraken" ? "CRYPTO_EXCHANGE" : "BROKERAGE",
+        currency: broker.currency,
+      });
+      await queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+      return resp.data.id;
+    } catch {
+      toast.error("Failed to create account");
+      return null;
+    } finally {
+      setIsCreating(false);
+    }
+  };
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     accept: {
@@ -263,9 +231,11 @@ function BrokerUploadPanel({
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
       "application/vnd.ms-excel": [".xls"],
     },
-    disabled: !accountId,
+    disabled: isCreating,
     onDrop: async (files) => {
+      const accountId = await getOrCreateAccountId();
       if (!accountId) return;
+
       const file = files[0];
       const formData = new FormData();
       formData.append("file", file);
@@ -332,36 +302,11 @@ function BrokerUploadPanel({
         )}
       </div>
 
-      {/* Account selector */}
-      <div className="space-y-2">
-        <div className="flex items-center justify-between">
-          <label className="text-xs text-gray-400">Import into account</label>
-          <button
-            onClick={() => setShowCreate((v) => !v)}
-            className="text-xs text-blue-400 hover:text-blue-300"
-          >
-            + New account
-          </button>
+      {/* Account info */}
+      {existingAccount && (
+        <div className="flex items-center gap-2 text-xs text-gray-400 bg-gray-800/30 rounded-lg px-3 py-2 border border-gray-800">
+          <span>Importing into existing account: <strong className="text-gray-200">{existingAccount.name}</strong> ({existingAccount.currency})</span>
         </div>
-        <select
-          value={accountId}
-          onChange={(e) => setAccountId(e.target.value)}
-          className="bg-gray-800 border border-gray-700 text-gray-200 rounded-lg px-3 py-2 text-sm w-full focus:outline-none focus:border-blue-500"
-        >
-          <option value="">— Select account —</option>
-          {accounts.map((a: any) => (
-            <option key={a.id} value={a.id}>
-              {a.name} ({a.currency})
-            </option>
-          ))}
-        </select>
-      </div>
-
-      {showCreate && (
-        <CreateAccountForm
-          broker={broker}
-          onCreated={() => setShowCreate(false)}
-        />
       )}
 
       {/* Drop zone */}
@@ -369,22 +314,269 @@ function BrokerUploadPanel({
         {...getRootProps()}
         className={clsx(
           "border-2 border-dashed rounded-xl p-6 text-center cursor-pointer transition-all",
-          !accountId && "opacity-40 pointer-events-none",
+          isCreating && "opacity-40 pointer-events-none",
           isDragActive ? "border-blue-500 bg-blue-500/10" : "border-gray-700 hover:border-gray-600"
         )}
       >
         <input {...getInputProps()} />
         <Upload className="w-6 h-6 text-gray-500 mx-auto mb-2" />
         <p className="text-gray-300 text-sm">
-          {isDragActive ? "Drop your file here" : `Drop your ${broker.label} ${broker.fileTypes} file here`}
+          {isCreating
+            ? "Creating account…"
+            : isDragActive
+              ? "Drop your file here"
+              : `Drop your ${broker.label} ${broker.fileTypes} file here`}
         </p>
         <p className="text-gray-600 text-xs mt-1">
           or click to browse · Trades in {broker.currency} will be auto-detected
         </p>
-        {!accountId && (
-          <p className="text-amber-500 text-xs mt-2">Select or create an account first</p>
+        {!existingAccount && (
+          <p className="text-gray-500 text-xs mt-2">
+            A {broker.label} account will be created automatically on upload
+          </p>
         )}
       </div>
+    </div>
+  );
+}
+
+// ─── API Sync Panel ─────────────────────────────────────────────────────
+
+function ApiSyncPanel({
+  broker,
+  accounts,
+  onImportDone,
+}: {
+  broker: BrokerInfo;
+  accounts: any[];
+  onImportDone: () => void;
+}) {
+  const [apiKey, setApiKey] = useState("");
+  const [apiSecret, setApiSecret] = useState("");
+  const [showSecret, setShowSecret] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncResult, setSyncResult] = useState<{ imported: number; error?: string } | null>(null);
+  const queryClient = useQueryClient();
+
+  const existingAccount = accounts.find(
+    (a: any) => a.institution_name === broker.label || a.name === broker.label
+  );
+
+  // Check if already connected (has synced before)
+  const isConnected = existingAccount?.sync_status === "SYNCED" || existingAccount?.sync_status === "ERROR";
+
+  const getOrCreateAccountId = async (): Promise<string | null> => {
+    if (existingAccount) return existingAccount.id;
+    try {
+      const resp = await api.post("/portfolio/accounts", {
+        name: broker.label,
+        institution_name: broker.label,
+        account_type: broker.id === "kraken" ? "CRYPTO_EXCHANGE" : "BROKERAGE",
+        currency: broker.currency,
+      });
+      await queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+      return resp.data.id;
+    } catch {
+      toast.error("Failed to create account");
+      return null;
+    }
+  };
+
+  const handleConnect = async () => {
+    if (!apiKey.trim() || !apiSecret.trim()) {
+      toast.error("Please enter both API Key and Private Key");
+      return;
+    }
+
+    setIsConnecting(true);
+    setSyncResult(null);
+    try {
+      const accountId = await getOrCreateAccountId();
+      if (!accountId) return;
+
+      // Store credentials
+      await api.post("/sync/connect/exchange", {
+        account_id: accountId,
+        provider: broker.apiProvider,
+        api_key: apiKey.trim(),
+        api_secret: apiSecret.trim(),
+      });
+
+      toast.success("API credentials saved. Syncing trades...");
+
+      // Trigger sync immediately
+      setIsSyncing(true);
+      const syncResp = await api.post(`/sync/accounts/${accountId}/trigger`);
+      const result = syncResp.data;
+
+      if (result.error) {
+        setSyncResult({ imported: 0, error: result.error });
+        toast.error(`Sync error: ${result.error}`);
+      } else {
+        setSyncResult({ imported: result.imported });
+        toast.success(`Imported ${result.imported} transaction${result.imported !== 1 ? "s" : ""} from ${broker.label}`);
+        queryClient.invalidateQueries({ queryKey: ["transactions"] });
+        queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+        onImportDone();
+      }
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail ?? "Connection failed. Check your API credentials.";
+      setSyncResult({ imported: 0, error: detail });
+      toast.error(detail);
+    } finally {
+      setIsConnecting(false);
+      setIsSyncing(false);
+    }
+  };
+
+  const handleResync = async () => {
+    if (!existingAccount) return;
+    setIsSyncing(true);
+    setSyncResult(null);
+    try {
+      const syncResp = await api.post(`/sync/accounts/${existingAccount.id}/trigger`);
+      const result = syncResp.data;
+      if (result.error) {
+        setSyncResult({ imported: 0, error: result.error });
+        toast.error(`Sync error: ${result.error}`);
+      } else {
+        setSyncResult({ imported: result.imported });
+        toast.success(`Imported ${result.imported} new transaction${result.imported !== 1 ? "s" : ""}`);
+        queryClient.invalidateQueries({ queryKey: ["transactions"] });
+        queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+      }
+    } catch (e: any) {
+      toast.error(e?.response?.data?.detail ?? "Sync failed");
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Instructions */}
+      <div className="bg-gray-800/40 rounded-lg border border-gray-700/50 px-4 py-3">
+        <div className="flex items-center gap-2 mb-2">
+          <Key className="w-4 h-4 text-blue-400" />
+          <span className="text-sm font-medium text-gray-200">
+            How to get your {broker.label} API Key
+          </span>
+        </div>
+        <ol className="space-y-1.5 ml-1">
+          {broker.apiInstructions?.map((step, i) => (
+            <li key={i} className="flex gap-3 text-sm">
+              <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-500/20 text-blue-400 text-xs font-medium flex items-center justify-center mt-0.5">
+                {i + 1}
+              </span>
+              <span className="text-gray-400">{step}</span>
+            </li>
+          ))}
+        </ol>
+        <div className="mt-3 flex items-start gap-2 text-xs text-amber-400 bg-amber-400/10 rounded-lg px-3 py-2">
+          <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+          <span>Only grant read-only permissions. Never enable trading or withdrawal access for third-party apps.</span>
+        </div>
+      </div>
+
+      {/* Existing account info */}
+      {existingAccount && (
+        <div className="flex items-center justify-between text-xs bg-gray-800/30 rounded-lg px-3 py-2 border border-gray-800">
+          <span className="text-gray-400">
+            Account: <strong className="text-gray-200">{existingAccount.name}</strong>
+            {existingAccount.last_synced_at && (
+              <> · Last synced: {new Date(existingAccount.last_synced_at).toLocaleString()}</>
+            )}
+          </span>
+          {isConnected && (
+            <button
+              onClick={handleResync}
+              disabled={isSyncing}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 transition-colors disabled:opacity-50"
+            >
+              {isSyncing ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <RefreshCw className="w-3 h-3" />
+              )}
+              {isSyncing ? "Syncing..." : "Re-sync"}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* API Key inputs */}
+      {!isConnected && (
+        <div className="space-y-3">
+          <div>
+            <label className="block text-xs font-medium text-gray-400 mb-1.5">API Key</label>
+            <input
+              type="text"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder="Enter your API Key"
+              className="w-full px-3 py-2.5 bg-gray-800/60 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30 font-mono"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-400 mb-1.5">Private Key (Secret)</label>
+            <div className="relative">
+              <input
+                type={showSecret ? "text" : "password"}
+                value={apiSecret}
+                onChange={(e) => setApiSecret(e.target.value)}
+                placeholder="Enter your Private Key"
+                className="w-full px-3 py-2.5 bg-gray-800/60 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30 font-mono pr-10"
+              />
+              <button
+                type="button"
+                onClick={() => setShowSecret(!showSecret)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
+              >
+                {showSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+          </div>
+          <button
+            onClick={handleConnect}
+            disabled={isConnecting || !apiKey.trim() || !apiSecret.trim()}
+            className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm font-medium rounded-lg transition-colors"
+          >
+            {isConnecting ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                {isSyncing ? "Syncing trades..." : "Connecting..."}
+              </>
+            ) : (
+              <>
+                <Key className="w-4 h-4" />
+                Connect & Sync
+              </>
+            )}
+          </button>
+        </div>
+      )}
+
+      {/* Sync result */}
+      {syncResult && (
+        <div className={clsx(
+          "flex items-center gap-2 text-sm rounded-lg px-4 py-3 border",
+          syncResult.error
+            ? "text-red-400 bg-red-400/10 border-red-400/20"
+            : "text-green-400 bg-green-400/10 border-green-400/20"
+        )}>
+          {syncResult.error ? (
+            <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+          ) : (
+            <Check className="w-4 h-4 flex-shrink-0" />
+          )}
+          <span>
+            {syncResult.error
+              ? syncResult.error
+              : `Successfully imported ${syncResult.imported} transaction${syncResult.imported !== 1 ? "s" : ""}`}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -481,7 +673,7 @@ function AccountCard({
           <button
             onClick={() => onRemove(account.id, account.name)}
             className="text-gray-600 hover:text-red-400 transition-colors p-1 rounded hover:bg-red-400/10"
-            title="Remove account and all transactions"
+            title="Permanently delete account and all transactions"
           >
             <Trash2 className="w-3.5 h-3.5" />
           </button>
@@ -575,6 +767,7 @@ function AccountCard({
 export default function TransactionsPage() {
   const [showImport, setShowImport] = useState(false);
   const [selectedBroker, setSelectedBroker] = useState<BrokerInfo | null>(null);
+  const [importTab, setImportTab] = useState<"csv" | "api">("csv");
   const queryClient = useQueryClient();
 
   // Fetch ALL accounts (including inactive) for this page
@@ -603,19 +796,21 @@ export default function TransactionsPage() {
     onSuccess: (data) => {
       toast.success(data.is_active ? `${data.name} included in dashboard` : `${data.name} excluded from dashboard`);
       queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+      queryClient.invalidateQueries({ queryKey: ["analytics"] });
     },
     onError: () => toast.error("Failed to update account"),
   });
 
-  // Remove account (soft delete)
+  // Remove account (hard delete — permanently removes account + transactions)
   const removeMutation = useMutation({
     mutationFn: (id: string) => api.delete(`/portfolio/accounts/${id}`),
     onSuccess: () => {
-      toast.success("Account removed");
+      toast.success("Account and transactions permanently deleted");
       queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+      queryClient.invalidateQueries({ queryKey: ["analytics"] });
       queryClient.invalidateQueries({ queryKey: ["transactions"] });
     },
-    onError: () => toast.error("Failed to remove account"),
+    onError: () => toast.error("Failed to delete account"),
   });
 
   const handleToggle = (id: string, active: boolean) => {
@@ -623,7 +818,7 @@ export default function TransactionsPage() {
   };
 
   const handleRemove = (id: string, name: string) => {
-    if (confirm(`Remove "${name}" and exclude all its transactions from calculations?\n\nThis will not delete the data — you can re-add the account later.`)) {
+    if (confirm(`Permanently delete "${name}" and all its transactions?\n\nThis action cannot be undone. To temporarily exclude an account, use the checkbox instead.`)) {
       removeMutation.mutate(id);
     }
   };
@@ -675,14 +870,17 @@ export default function TransactionsPage() {
                 {BROKERS.map((b) => (
                   <button
                     key={b.id}
-                    onClick={() => setSelectedBroker(b)}
+                    onClick={() => { setSelectedBroker(b); setImportTab(b.supportsApiSync ? "api" : "csv"); }}
                     className="flex flex-col items-center gap-2 p-4 rounded-xl border border-gray-700/50 bg-gray-800/30 hover:bg-gray-800/60 hover:border-gray-600 transition-all text-center group"
                   >
                     <div className="w-10 h-10 rounded-lg bg-gray-700/50 flex items-center justify-center text-lg font-bold text-gray-300 group-hover:text-blue-400 transition-colors">
                       {b.label.slice(0, 2).toUpperCase()}
                     </div>
                     <span className="text-sm font-medium text-gray-200">{b.label}</span>
-                    <span className="text-xs text-gray-500">{b.currency} · {b.country}</span>
+                    <span className="text-xs text-gray-500">
+                      {b.currency} · {b.country}
+                      {b.supportsApiSync && " · API"}
+                    </span>
                   </button>
                 ))}
               </div>
@@ -695,16 +893,60 @@ export default function TransactionsPage() {
               >
                 <ChevronRight className="w-3 h-3 rotate-180" /> Back to all brokers
               </button>
-              <BrokerUploadPanel
-                broker={selectedBroker}
-                accounts={allAccounts}
-                onImportDone={() => {
-                  setShowImport(false);
-                  setSelectedBroker(null);
-                  queryClient.invalidateQueries({ queryKey: ["transactions"] });
-                  queryClient.invalidateQueries({ queryKey: ["portfolio"] });
-                }}
-              />
+
+              {/* Tabs for brokers with API sync */}
+              {selectedBroker.supportsApiSync && (
+                <div className="flex gap-1 mb-4 bg-gray-800/40 rounded-lg p-1 border border-gray-700/50">
+                  <button
+                    onClick={() => setImportTab("api")}
+                    className={clsx(
+                      "flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-md text-sm font-medium transition-colors",
+                      importTab === "api"
+                        ? "bg-blue-600/20 text-blue-400 border border-blue-500/30"
+                        : "text-gray-400 hover:text-gray-200 border border-transparent"
+                    )}
+                  >
+                    <Key className="w-3.5 h-3.5" />
+                    Connect API
+                  </button>
+                  <button
+                    onClick={() => setImportTab("csv")}
+                    className={clsx(
+                      "flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-md text-sm font-medium transition-colors",
+                      importTab === "csv"
+                        ? "bg-blue-600/20 text-blue-400 border border-blue-500/30"
+                        : "text-gray-400 hover:text-gray-200 border border-transparent"
+                    )}
+                  >
+                    <Upload className="w-3.5 h-3.5" />
+                    Upload CSV
+                  </button>
+                </div>
+              )}
+
+              {importTab === "csv" || !selectedBroker.supportsApiSync ? (
+                <BrokerUploadPanel
+                  broker={selectedBroker}
+                  accounts={allAccounts}
+                  onImportDone={() => {
+                    setShowImport(false);
+                    setSelectedBroker(null);
+                    queryClient.invalidateQueries({ queryKey: ["transactions"] });
+                    queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+                  }}
+                />
+              ) : (
+                <ApiSyncPanel
+                  broker={selectedBroker}
+                  accounts={allAccounts}
+                  onImportDone={() => {
+                    setShowImport(false);
+                    setSelectedBroker(null);
+                    queryClient.invalidateQueries({ queryKey: ["transactions"] });
+                    queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+                  }}
+                />
+              )}
             </div>
           )}
         </div>
@@ -732,18 +974,13 @@ export default function TransactionsPage() {
         </div>
       )}
 
-      {!isLoading && allAccounts.length === 0 && (
+      {!isLoading && allAccounts.length === 0 && !showImport && (
         <div className="card-glass text-center py-16 space-y-3">
           <Upload className="w-10 h-10 text-gray-700 mx-auto" />
           <p className="text-gray-500 text-sm">No investment accounts yet</p>
-          <p className="text-gray-600 text-xs">Import your trade history from any supported broker to get started.</p>
-          <button
-            onClick={() => setShowImport(true)}
-            className="btn-primary text-sm px-5 py-2 mt-2"
-          >
-            <Plus className="w-4 h-4 inline mr-1.5 -mt-0.5" />
-            Add Investment
-          </button>
+          <p className="text-gray-600 text-xs">
+            Click <strong className="text-gray-400">Add Investment</strong> above to import your trade history.
+          </p>
         </div>
       )}
 

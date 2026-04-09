@@ -30,14 +30,20 @@ class MarketDataService:
       Crypto:   CoinGecko → CoinMarketCap
     """
 
-    CRYPTO_SYMBOLS = {"BTC", "ETH", "SOL", "USDT", "USDC", "BNB", "XRP", "ADA", "MATIC", "LINK", "DOT", "AVAX"}
+    CRYPTO_SYMBOLS = {
+        "BTC", "ETH", "SOL", "USDT", "USDC", "BNB", "XRP", "ADA", "MATIC", "LINK",
+        "DOT", "AVAX", "EIGEN", "BABY", "DOGE", "UNI", "AAVE", "ATOM", "LTC",
+    }
 
     def __init__(self):
         self._http = httpx.AsyncClient(timeout=15.0, limits=httpx.Limits(max_connections=100))
+        self._asx_symbols: set[str] = set()  # Track symbols that need .AX suffix
 
-    async def get_price(self, symbol: str) -> Optional[float]:
+    async def get_price(self, symbol: str, currency: str = "USD") -> Optional[float]:
         """Get current price for a single symbol."""
-        cache_key = f"market:price:{symbol}:spot"
+        # For AUD assets, use .AX cache key to differentiate from US version
+        cache_suffix = ":AX" if currency.upper() == "AUD" else ""
+        cache_key = f"market:price:{symbol}{cache_suffix}:spot"
         cached = await cache_get(cache_key)
         if cached is not None:
             return cached
@@ -46,24 +52,33 @@ class MarketDataService:
         if self._is_crypto(symbol):
             price = await self._get_crypto_price(symbol)
         else:
-            price = await self._get_equity_price(symbol)
+            price = await self._get_equity_price(symbol, currency)
 
         if price is not None:
             await cache_set(cache_key, price, ttl=60)  # 60s TTL for spot prices
 
         return price
 
-    async def get_batch_prices(self, symbols: list[str]) -> dict[str, float]:
-        """Get current prices for multiple symbols efficiently."""
+    async def get_batch_prices(
+        self, symbols: list[str], symbol_currencies: Optional[dict[str, str]] = None
+    ) -> dict[str, float]:
+        """
+        Get current prices for multiple symbols efficiently.
+        symbol_currencies: optional dict of {symbol: currency} to resolve exchange.
+        """
         if not symbols:
             return {}
+
+        ccys = symbol_currencies or {}
 
         # Check cache first
         result: dict[str, float] = {}
         uncached: list[str] = []
 
         for sym in symbols:
-            cached = await cache_get(f"market:price:{sym}:spot")
+            ccy = ccys.get(sym, "USD").upper()
+            cache_suffix = ":AX" if ccy == "AUD" else ""
+            cached = await cache_get(f"market:price:{sym}{cache_suffix}:spot")
             if cached is not None:
                 result[sym] = cached
             else:
@@ -83,10 +98,12 @@ class MarketDataService:
                 await cache_set(f"market:price:{sym}:spot", price, ttl=60)
 
         if equity_syms:
-            equity_prices = await self._get_batch_equity_prices(equity_syms)
+            equity_prices = await self._get_batch_equity_prices(equity_syms, ccys)
             result.update(equity_prices)
             for sym, price in equity_prices.items():
-                await cache_set(f"market:price:{sym}:spot", price, ttl=60)
+                ccy = ccys.get(sym, "USD").upper()
+                cache_suffix = ":AX" if ccy == "AUD" else ""
+                await cache_set(f"market:price:{sym}{cache_suffix}:spot", price, ttl=60)
 
         return result
 
@@ -133,25 +150,31 @@ class MarketDataService:
     # ─── Equity Providers ────────────────────────────────────────────────
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
-    async def _get_equity_price(self, symbol: str) -> Optional[float]:
-        """Polygon → Yahoo Finance fallback."""
-        try:
-            return await self._polygon_spot(symbol)
-        except Exception as e:
-            logger.warning(f"Polygon failed for {symbol}: {e}")
+    async def _get_equity_price(self, symbol: str, currency: str = "USD") -> Optional[float]:
+        """Polygon → Yahoo Finance fallback. Currency hint for exchange resolution."""
+        # Skip Polygon for AUD assets (it doesn't support ASX)
+        if currency.upper() != "AUD":
+            try:
+                return await self._polygon_spot(symbol)
+            except Exception as e:
+                logger.warning(f"Polygon failed for {symbol}: {e}")
 
         try:
-            return await self._yahoo_spot(symbol)
+            return await self._yahoo_spot(symbol, currency)
         except Exception as e:
             logger.warning(f"Yahoo failed for {symbol}: {e}")
 
         return None
 
-    async def _get_batch_equity_prices(self, symbols: list[str]) -> dict[str, float]:
+    async def _get_batch_equity_prices(
+        self, symbols: list[str], symbol_currencies: Optional[dict[str, str]] = None
+    ) -> dict[str, float]:
         """Fetch multiple equity prices."""
+        ccys = symbol_currencies or {}
         results = {}
         for sym in symbols:
-            price = await self._get_equity_price(sym)
+            ccy = ccys.get(sym, "USD")
+            price = await self._get_equity_price(sym, ccy)
             if price is not None:
                 results[sym] = price
         return results
@@ -168,15 +191,32 @@ class MarketDataService:
         data = resp.json()
         return float(data["results"]["p"])  # price
 
-    async def _yahoo_spot(self, symbol: str) -> Optional[float]:
-        """Fetch price from Yahoo Finance (unofficial API)."""
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = await self._http.get(url, headers=headers, params={"interval": "1d", "range": "1d"})
-        resp.raise_for_status()
-        data = resp.json()
-        meta = data["chart"]["result"][0]["meta"]
-        return float(meta.get("regularMarketPrice", meta.get("previousClose", 0)))
+    async def _yahoo_spot(self, symbol: str, currency: str = "USD") -> Optional[float]:
+        """Fetch price from Yahoo Finance. For AUD assets, tries .AX first (ASX)."""
+        # AUD assets → try .AX first, then plain; USD assets → plain first, then .AX
+        if currency.upper() == "AUD":
+            suffixes = (".AX", "")
+        else:
+            suffixes = ("", ".AX")
+
+        for suffix in suffixes:
+            try:
+                yf_symbol = f"{symbol}{suffix}"
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_symbol}"
+                headers = {"User-Agent": "Mozilla/5.0"}
+                resp = await self._http.get(url, headers=headers, params={"interval": "1d", "range": "1d"})
+                resp.raise_for_status()
+                data = resp.json()
+                meta = data["chart"]["result"][0]["meta"]
+                price = float(meta.get("regularMarketPrice", meta.get("previousClose", 0)))
+                if price > 0:
+                    if suffix == ".AX":
+                        self._asx_symbols.add(symbol)
+                    return price
+            except Exception as e:
+                logger.debug(f"Yahoo spot {symbol}{suffix}: {e}")
+                continue
+        return None
 
     async def _get_equity_history(self, symbol: str, start: datetime, end: datetime) -> list[dict]:
         """Fetch OHLCV from Polygon or Yahoo."""
@@ -209,7 +249,8 @@ class MarketDataService:
         ]
 
     async def _yahoo_history(self, symbol: str, start: datetime, end: datetime) -> list[dict]:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        yf_symbol = f"{symbol}.AX" if symbol in self._asx_symbols else symbol
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_symbol}"
         headers = {"User-Agent": "Mozilla/5.0"}
         params = {
             "interval": "1d",
@@ -259,7 +300,7 @@ class MarketDataService:
 
         params: dict = {"ids": ",".join(coin_ids), "vs_currencies": "usd"}
         api_key = settings.coingecko_api_key.get_secret_value()
-        if api_key:
+        if api_key and not api_key.startswith("your-"):
             params["x_cg_pro_api_key"] = api_key
 
         resp = await self._http.get("https://api.coingecko.com/api/v3/simple/price", params=params)
@@ -274,6 +315,7 @@ class MarketDataService:
 
     async def _get_crypto_history(self, symbol: str, start: datetime, end: datetime) -> list[dict]:
         """CoinGecko historical prices."""
+        import asyncio
         cg_id = self._symbol_to_coingecko_id([symbol]).get(symbol)
         if not cg_id:
             return []
@@ -283,17 +325,38 @@ class MarketDataService:
             "from": int(start.timestamp()),
             "to": int(end.timestamp()),
         }
-        resp = await self._http.get(f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart/range", params=params)
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            # Small delay to avoid CoinGecko rate limits (free tier: ~10-30 req/min)
+            await asyncio.sleep(0.5)
+            resp = await self._http.get(
+                f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart/range",
+                params=params,
+            )
+            if resp.status_code == 429:
+                logger.warning(f"CoinGecko rate limit for {symbol}, retrying after delay")
+                await asyncio.sleep(5)
+                resp = await self._http.get(
+                    f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart/range",
+                    params=params,
+                )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning(f"CoinGecko history failed for {symbol} ({cg_id}): {e}")
+            return []
 
-        return [
-            {
-                "date": datetime.fromtimestamp(p[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
-                "close": p[1], "open": p[1], "high": p[1], "low": p[1], "volume": 0,
-            }
-            for p in data.get("prices", [])
-        ]
+        # Deduplicate by date (CoinGecko can return multiple points per day for short ranges)
+        seen_dates: set[str] = set()
+        results: list[dict] = []
+        for p in data.get("prices", []):
+            date_str = datetime.fromtimestamp(p[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            if date_str not in seen_dates:
+                seen_dates.add(date_str)
+                results.append({
+                    "date": date_str,
+                    "close": p[1], "open": p[1], "high": p[1], "low": p[1], "volume": 0,
+                })
+        return results
 
     # ─── Utilities ───────────────────────────────────────────────────────
 
@@ -310,6 +373,7 @@ class MarketDataService:
             "DOGE": "dogecoin", "UNI": "uniswap", "AAVE": "aave",
             "ATOM": "cosmos", "LTC": "litecoin", "BCH": "bitcoin-cash",
             "ALGO": "algorand", "XLM": "stellar",
+            "EIGEN": "eigenlayer", "BABY": "babylon",
         }
         return {sym: MAPPING[sym.upper()] for sym in symbols if sym.upper() in MAPPING}
 

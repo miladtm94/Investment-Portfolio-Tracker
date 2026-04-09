@@ -1,4 +1,5 @@
 """Sync router — broker and exchange account synchronization."""
+import logging
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -8,7 +9,11 @@ from sqlalchemy import select
 from database import get_db
 from shared.models import Account, ApiCredential, User
 from shared.auth import get_current_user
+from shared.cache import cache_delete_pattern, cache_invalidate_user
 from services.sync_service import SyncService
+from services.dividend_service import DividendService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -47,18 +52,33 @@ async def connect_exchange(
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Account not found")
 
-    # In production: encrypt with KMS before storing
-    # Here we store as bytes for demonstration
-    cred = ApiCredential(
-        user_id=current_user.id,
-        account_id=body.account_id,
-        provider=body.provider.upper(),
-        credential_type="API_KEY",
-        encrypted_api_key=body.api_key.encode(),
-        encrypted_api_secret=body.api_secret.encode(),
-        encryption_key_id="default",
+    # Upsert: update existing credentials or create new ones
+    existing = await db.execute(
+        select(ApiCredential).where(
+            ApiCredential.user_id == current_user.id,
+            ApiCredential.provider == body.provider.upper(),
+            ApiCredential.credential_type == "API_KEY",
+        )
     )
-    db.add(cred)
+    cred = existing.scalar_one_or_none()
+
+    if cred:
+        cred.account_id = body.account_id
+        cred.encrypted_api_key = body.api_key.encode()
+        cred.encrypted_api_secret = body.api_secret.encode()
+        cred.is_active = True
+    else:
+        cred = ApiCredential(
+            user_id=current_user.id,
+            account_id=body.account_id,
+            provider=body.provider.upper(),
+            credential_type="API_KEY",
+            encrypted_api_key=body.api_key.encode(),
+            encrypted_api_secret=body.api_secret.encode(),
+            encryption_key_id="default",
+        )
+        db.add(cred)
+
     await db.commit()
 
     return {"message": "Credentials stored. Initiating sync.", "account_id": body.account_id}
@@ -100,4 +120,87 @@ async def get_sync_status(
         "account_id": account_id,
         "sync_status": account.sync_status,
         "last_synced_at": account.last_synced_at.isoformat() if account.last_synced_at else None,
+    }
+
+
+@router.post("/refresh-all")
+async def refresh_all(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Full dashboard refresh:
+    1. Flush cached FX rates and market prices
+    2. Sync all API-connected accounts (Kraken, etc.)
+    3. Invalidate portfolio/analytics caches
+    """
+    steps: list[dict] = []
+
+    # 1. Flush only spot price caches (short-lived anyway, 60s TTL)
+    #    Keep historical price and FX caches intact to avoid rate-limit issues
+    spot_cleared = await cache_delete_pattern("market:price:*:spot")
+    # Flush today's FX rates (1h TTL) so they refresh, keep historical rates
+    from datetime import datetime, timezone
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    fx_cleared = await cache_delete_pattern(f"fx:*:{today_str}")
+    steps.append({"step": "cache_flush", "spot_keys": spot_cleared, "fx_keys": fx_cleared})
+
+    # 2. Find all API-connected accounts and sync them
+    cred_result = await db.execute(
+        select(ApiCredential).where(
+            ApiCredential.user_id == current_user.id,
+            ApiCredential.is_active == True,
+            ApiCredential.credential_type == "API_KEY",
+        )
+    )
+    credentials = cred_result.scalars().all()
+
+    sync_results: list[dict] = []
+    for cred in credentials:
+        if not cred.account_id:
+            continue
+        try:
+            svc = SyncService(db)
+            result = await svc.sync_account(cred.account_id, current_user.id)
+            await svc.close()
+            sync_results.append({
+                "account_id": cred.account_id,
+                "provider": cred.provider,
+                "imported": result.get("imported", 0),
+                "error": result.get("error"),
+            })
+        except Exception as e:
+            logger.warning(f"Sync failed for {cred.provider} account {cred.account_id}: {e}")
+            sync_results.append({
+                "account_id": cred.account_id,
+                "provider": cred.provider,
+                "imported": 0,
+                "error": str(e),
+            })
+    steps.append({"step": "sync_accounts", "results": sync_results})
+
+    # 3. Fetch US equity dividends via Polygon
+    dividend_svc = DividendService(db)
+    try:
+        dividend_result = await dividend_svc.sync_us_dividends(current_user)
+    finally:
+        await dividend_svc.close()
+    steps.append({"step": "dividends", "result": dividend_result})
+
+    # 4. Invalidate portfolio/analytics caches so fresh prices are used
+    await cache_invalidate_user(current_user.id)
+    steps.append({"step": "cache_invalidate"})
+
+    dividend_inserted = dividend_result.get("inserted", 0) if isinstance(dividend_result, dict) else 0
+    total_imported = sum(r["imported"] for r in sync_results) + dividend_inserted
+    errors = [r for r in sync_results if r.get("error")]
+    if isinstance(dividend_result, dict) and dividend_result.get("errors"):
+        errors.extend(dividend_result.get("errors"))
+
+    return {
+        "status": "completed",
+        "accounts_synced": len(sync_results),
+        "total_imported": total_imported,
+        "errors": errors,
+        "steps": steps,
     }

@@ -104,40 +104,87 @@ class KrakenConnector:
         api_secret = self._decrypt(credential.encrypted_api_secret)
 
         imported = 0
-        # Fetch trade history
-        trades = await self._fetch_trades(api_key, api_secret)
-        for trade in trades:
-            txn = await self._normalize_trade(trade, account.id, user_id)
+        errors = []
+
+        # Fetch trade history — track which base symbol each trade imported
+        trades, trade_err = await self._fetch_trades(api_key, api_secret)
+        if trade_err:
+            errors.append(trade_err)
+        # Map trade_id → base symbol imported from /TradesHistory
+        trade_base_symbols: dict[str, str] = {}
+        for trade_id, trade in trades:
+            pair = trade.get("pair", "")
+            base_sym, _ = self._parse_pair(pair)
+            trade_base_symbols[trade_id] = base_sym
+            txn = await self._normalize_trade(trade, trade_id, account.id, user_id)
             if txn:
                 imported += 1
 
-        # Fetch ledger entries (deposits, withdrawals, staking)
-        ledger = await self._fetch_ledger(api_key, api_secret)
-        for entry in ledger:
-            txn = await self._normalize_ledger_entry(entry, account.id, user_id)
+        # Fetch ledger entries (deposits, withdrawals, staking, trade quote-side)
+        ledger, ledger_err = await self._fetch_ledger(api_key, api_secret)
+        if ledger_err:
+            errors.append(ledger_err)
+        for ledger_id, entry in ledger:
+            txn = await self._normalize_ledger_entry(entry, ledger_id, trade_base_symbols, account.id, user_id)
             if txn:
                 imported += 1
 
         await self.db.commit()
-        return {"imported": imported, "provider": "kraken"}
 
-    async def _fetch_trades(self, api_key: str, api_secret: str) -> list[dict]:
-        """Fetch /TradesHistory endpoint."""
+        result: dict = {"imported": imported, "provider": "kraken"}
+        if errors and imported == 0:
+            result["error"] = "; ".join(errors)
+        return result
+
+    async def _fetch_trades(self, api_key: str, api_secret: str) -> tuple[list[tuple[str, dict]], Optional[str]]:
+        """Fetch all pages from /TradesHistory. Returns list of (trade_id, trade_data)."""
         try:
-            data = await self._private_request("/0/private/TradesHistory", {}, api_key, api_secret)
-            return list(data.get("result", {}).get("trades", {}).values())
+            all_trades: list[tuple[str, dict]] = []
+            offset = 0
+            while True:
+                data = await self._private_request(
+                    "/0/private/TradesHistory", {"ofs": offset}, api_key, api_secret
+                )
+                trades = data.get("result", {}).get("trades", {})
+                if not trades:
+                    break
+                all_trades.extend(trades.items())  # preserve trade IDs as keys
+                count = data.get("result", {}).get("count", 0)
+                offset += len(trades)
+                if offset >= count:
+                    break
+                import asyncio
+                await asyncio.sleep(1)
+            logger.info(f"Kraken: fetched {len(all_trades)} trades (paginated)")
+            return all_trades, None
         except Exception as e:
             logger.error(f"Kraken trades fetch error: {e}")
-            return []
+            return [], str(e)
 
-    async def _fetch_ledger(self, api_key: str, api_secret: str) -> list[dict]:
-        """Fetch /Ledgers endpoint."""
+    async def _fetch_ledger(self, api_key: str, api_secret: str) -> tuple[list[tuple[str, dict]], Optional[str]]:
+        """Fetch all pages from /Ledgers. Returns list of (ledger_id, entry_data)."""
         try:
-            data = await self._private_request("/0/private/Ledgers", {}, api_key, api_secret)
-            return list(data.get("result", {}).get("ledger", {}).values())
+            all_entries: list[tuple[str, dict]] = []
+            offset = 0
+            while True:
+                data = await self._private_request(
+                    "/0/private/Ledgers", {"ofs": offset}, api_key, api_secret
+                )
+                entries = data.get("result", {}).get("ledger", {})
+                if not entries:
+                    break
+                all_entries.extend(entries.items())  # preserve ledger IDs as keys
+                count = data.get("result", {}).get("count", 0)
+                offset += len(entries)
+                if offset >= count:
+                    break
+                import asyncio
+                await asyncio.sleep(1)
+            logger.info(f"Kraken: fetched {len(all_entries)} ledger entries (paginated)")
+            return all_entries, None
         except Exception as e:
             logger.error(f"Kraken ledger fetch error: {e}")
-            return []
+            return [], str(e)
 
     async def _private_request(self, path: str, data: dict, api_key: str, api_secret: str) -> dict:
         """Sign and execute a Kraken private API request."""
@@ -164,22 +211,26 @@ class KrakenConnector:
             raise Exception(f"Kraken API error: {result['error']}")
         return result
 
-    async def _normalize_trade(self, trade: dict, account_id: str, user_id: str) -> Optional[Transaction]:
+    async def _normalize_trade(self, trade: dict, trade_id: str, account_id: str, user_id: str) -> Optional[Transaction]:
         """Normalize a Kraken trade to canonical transaction."""
         try:
             pair = trade.get("pair", "")
-            # Extract base symbol (XXBT → BTC, XETH → ETH, etc.)
-            symbol = self._normalize_symbol(pair)
+            symbol, quote_currency = self._parse_pair(pair)
+
+            if not symbol or symbol == quote_currency or symbol in KrakenConnector.FIAT_SYMBOLS:
+                # Skip fiat trades (e.g., EURUSD) — stablecoins are kept
+                return None
 
             txn_type = "BUY" if trade.get("type") == "buy" else "SELL"
             quantity = Decimal(str(trade.get("vol", 0)))
             price = Decimal(str(trade.get("price", 0)))
             fees = Decimal(str(trade.get("fee", 0)))
+            cost = Decimal(str(trade.get("cost", 0)))
             time_val = trade.get("time", 0)
             txn_date = datetime.fromtimestamp(float(time_val), tz=timezone.utc)
 
-            external_id = trade.get("ordertxid", trade.get("txid", ""))
-            import_hash = hashlib.sha256(f"kraken|{external_id}|{txn_type}|{symbol}".encode()).hexdigest()
+            external_id = trade.get("ordertxid", trade_id)
+            import_hash = hashlib.sha256(f"kraken|trade|{trade_id}|{txn_type}|{symbol}".encode()).hexdigest()
 
             # Check duplicate
             existing = await self.db.execute(
@@ -190,6 +241,12 @@ class KrakenConnector:
 
             asset_id = await self._resolve_asset(symbol)
 
+            # Use Kraken's reported cost for net_amount (more accurate than qty * price)
+            if txn_type == "SELL":
+                net_amount = cost - fees
+            else:
+                net_amount = -(cost + fees)
+
             txn = Transaction(
                 account_id=account_id,
                 user_id=user_id,
@@ -198,12 +255,12 @@ class KrakenConnector:
                 quantity=quantity,
                 price_per_unit=price,
                 fees=fees,
-                net_amount=quantity * price - fees if txn_type == "SELL" else -(quantity * price + fees),
-                currency="USD",
+                net_amount=net_amount,
+                currency=quote_currency,
                 transacted_at=txn_date,
                 external_id=external_id,
                 import_hash=import_hash,
-                source="KRAKEN",
+                source="KRAKEN_API",
                 raw_data=trade,
             )
             self.db.add(txn)
@@ -212,34 +269,82 @@ class KrakenConnector:
             logger.warning(f"Failed to normalize Kraken trade: {e}")
             return None
 
-    async def _normalize_ledger_entry(self, entry: dict, account_id: str, user_id: str) -> Optional[Transaction]:
-        """Normalize a Kraken ledger entry (deposit, withdrawal, staking)."""
+    async def _normalize_ledger_entry(
+        self, entry: dict, ledger_id: str, trade_base_symbols: dict[str, str],
+        account_id: str, user_id: str,
+    ) -> Optional[Transaction]:
+        """Normalize a Kraken ledger entry (deposit, withdrawal, staking, trade quote-side)."""
         ledger_type = entry.get("type", "").lower()
-        type_map = {
-            "deposit": "DEPOSIT",
-            "withdrawal": "WITHDRAWAL",
-            "staking": "STAKE_REWARD",
-            "transfer": "TRANSFER_IN",
-        }
-        txn_type = type_map.get(ledger_type)
-        if not txn_type:
-            return None
 
         try:
             asset_code = entry.get("asset", "")
-            symbol = self._normalize_symbol(asset_code)
+            symbol = self._normalize_asset(asset_code)
+
+            # Skip fiat currency ledger entries
+            if symbol in KrakenConnector.FIAT_SYMBOLS:
+                return None
+
             amount = Decimal(str(entry.get("amount", 0)))
+            if amount == ZERO:
+                return None
+
+            is_stablecoin = symbol in KrakenConnector.STABLECOIN_SYMBOLS
+
+            # Map ledger types to transaction types
+            if ledger_type == "staking":
+                txn_type = "STAKE_REWARD"
+            elif ledger_type == "deposit":
+                txn_type = "TRANSFER_IN"
+            elif ledger_type == "withdrawal":
+                txn_type = "TRANSFER_OUT"
+            elif ledger_type == "transfer":
+                # Internal Kraken transfers (spot↔staking, spot↔futures).
+                # These don't change total holdings — skip them.
+                return None
+            elif ledger_type == "funding":
+                txn_type = "TRANSFER_IN" if amount > ZERO else "TRANSFER_OUT"
+            elif ledger_type == "spend":
+                # Kraken Pay / on-chain spend
+                txn_type = "TRANSFER_OUT"
+            elif ledger_type == "receive":
+                # Kraken Pay / on-chain receive
+                txn_type = "TRANSFER_IN"
+            elif ledger_type == "trade":
+                ref_id = entry.get("refid", "")
+                base_sym = trade_base_symbols.get(ref_id)
+                if base_sym and base_sym == symbol:
+                    # This is the base asset side — already imported via /TradesHistory
+                    return None
+                if not is_stablecoin and base_sym:
+                    # Non-stablecoin and trade exists in /TradesHistory — skip
+                    return None
+                txn_type = "BUY" if amount > ZERO else "SELL"
+            else:
+                logger.debug(f"Skipping Kraken ledger type '{ledger_type}' for {symbol}: amount={amount}")
+                return None
+
             fee = Decimal(str(entry.get("fee", 0)))
             time_val = entry.get("time", 0)
             txn_date = datetime.fromtimestamp(float(time_val), tz=timezone.utc)
             ref_id = entry.get("refid", "")
 
-            import_hash = hashlib.sha256(f"kraken|ledger|{ref_id}|{txn_type}".encode()).hexdigest()
+            # Use ledger_id (unique per entry) in import_hash to avoid collisions
+            import_hash = hashlib.sha256(f"kraken|ledger|{ledger_id}".encode()).hexdigest()
             existing = await self.db.execute(
                 select(Transaction).where(Transaction.import_hash == import_hash)
             )
             if existing.scalar_one_or_none():
                 return None
+
+            price_per_unit = Decimal("1.0") if is_stablecoin else None
+
+            # Kraken's `amount` is gross; `fee` is deducted separately.
+            # For inflows: net received = amount - fee
+            # For outflows: net spent = |amount| + fee
+            if amount > ZERO:
+                net_quantity = amount - fee
+            else:
+                net_quantity = abs(amount) + fee
 
             asset_id = await self._resolve_asset(symbol)
             txn = Transaction(
@@ -247,14 +352,15 @@ class KrakenConnector:
                 user_id=user_id,
                 asset_id=asset_id,
                 transaction_type=txn_type,
-                quantity=abs(amount),
+                quantity=net_quantity,
+                price_per_unit=price_per_unit,
                 fees=fee,
                 net_amount=amount,
                 currency="USD",
                 transacted_at=txn_date,
                 external_id=ref_id,
                 import_hash=import_hash,
-                source="KRAKEN",
+                source="KRAKEN_API",
                 raw_data=entry,
             )
             self.db.add(txn)
@@ -270,18 +376,76 @@ class KrakenConnector:
             asset = Asset(symbol=symbol, name=symbol, asset_class="CRYPTO", currency="USD")
             self.db.add(asset)
             await self.db.flush()
+        elif asset.asset_class != "CRYPTO":
+            # Fix misclassified crypto assets (e.g., BTC/ETH created as EQUITY by CSV import)
+            asset.asset_class = "CRYPTO"
+            await self.db.flush()
         return asset.id
 
-    @staticmethod
-    def _normalize_symbol(raw: str) -> str:
-        """Normalize Kraken asset symbols (XXBT→BTC, XETH→ETH, ZUSD→USD)."""
-        mapping = {
-            "XXBT": "BTC", "XBT": "BTC", "XETH": "ETH",
-            "ZUSD": "USD", "ZEUR": "EUR", "ZGBP": "GBP",
-            "XXRP": "XRP", "XLTC": "LTC", "XXLM": "XLM",
-        }
-        sym = raw.upper().split("/")[0].replace("USD", "")
-        return mapping.get(sym, sym) or raw.upper()
+    # Kraken uses non-standard asset codes
+    ASSET_MAP = {
+        "XXBT": "BTC", "XBT": "BTC", "XETH": "ETH", "XLTC": "LTC",
+        "XXRP": "XRP", "XXLM": "XLM", "XDAO": "DAO", "XXDG": "DOGE",
+        "ZUSD": "USD", "ZEUR": "EUR", "ZGBP": "GBP", "ZAUD": "AUD",
+        "ZCAD": "CAD", "ZJPY": "JPY", "ZCHF": "CHF",
+        # Staked variants → canonical symbol
+        "SOL03": "SOL", "SOL.S": "SOL", "ETH2": "ETH", "ETH.S": "ETH",
+        "DOT.S": "DOT", "DOT28": "DOT", "ADA.S": "ADA",
+        "ATOM.S": "ATOM", "MATIC.S": "MATIC", "XRP.S": "XRP",
+        "FLOW.S": "FLOW", "KAVA.S": "KAVA", "MINA.S": "MINA",
+        # Flexible staking variants
+        "SOL.F": "SOL", "ETH.F": "ETH", "DOT.F": "DOT", "ADA.F": "ADA",
+        "ATOM.F": "ATOM", "MATIC.F": "MATIC", "XRP.F": "XRP",
+    }
+
+    # True fiat currencies to skip in ledger entries
+    FIAT_SYMBOLS = {"USD", "EUR", "GBP", "AUD", "CAD", "JPY", "CHF"}
+    # Stablecoins — treated as crypto assets, NOT skipped
+    STABLECOIN_SYMBOLS = {"USDC", "USDT", "DAI", "BUSD"}
+
+    # Quote currencies Kraken appends to pairs (order matters: longest first)
+    QUOTE_SUFFIXES = ["USDC", "USDT", "ZUSD", "ZEUR", "ZAUD", "ZGBP", "USD", "EUR", "AUD", "GBP"]
+
+    @classmethod
+    def _normalize_asset(cls, raw: str) -> str:
+        """Normalize a single Kraken asset code: XXBT→BTC, SOL03→SOL, ETH.S→ETH."""
+        raw = raw.upper().strip()
+        # Check direct mapping first (includes staked variants like SOL03, ETH.S)
+        if raw in cls.ASSET_MAP:
+            return cls.ASSET_MAP[raw]
+        # Try with .S suffix stripped
+        base = raw.split(".")[0]
+        if base in cls.ASSET_MAP:
+            return cls.ASSET_MAP[base]
+        # Try stripping trailing digits for staked variants (SOL03→SOL, DOT28→DOT)
+        import re
+        base_no_digits = re.sub(r'\d+$', '', raw)
+        if base_no_digits and base_no_digits in cls.ASSET_MAP:
+            return cls.ASSET_MAP[base_no_digits]
+        return base_no_digits or base
+
+    @classmethod
+    def _parse_pair(cls, pair: str) -> tuple[str, str]:
+        """
+        Parse a Kraken trading pair into (base_symbol, quote_currency).
+        Examples: ETHUSDC → (ETH, USD), XBTUSDC → (BTC, USD), SOLUSDC → (SOL, USD),
+                  XETHZUSD → (ETH, USD), USDTZUSD → (USDT, USD)
+        """
+        pair = pair.upper().strip()
+
+        # Try known quote suffixes
+        for suffix in cls.QUOTE_SUFFIXES:
+            if pair.endswith(suffix) and len(pair) > len(suffix):
+                base_raw = pair[:-len(suffix)]
+                base = cls._normalize_asset(base_raw)
+                quote = cls._normalize_asset(suffix)
+                # Normalize stablecoin quotes to USD
+                if quote in ("USDC", "USDT"):
+                    quote = "USD"
+                return base, quote
+
+        # Fallback: return as-is
+        return cls._normalize_asset(pair), "USD"
 
     @staticmethod
     def _decrypt(encrypted: Optional[bytes]) -> str:

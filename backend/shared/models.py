@@ -36,6 +36,7 @@ class User(Base):
     accounts: Mapped[list["Account"]] = relationship("Account", back_populates="user", cascade="all, delete-orphan")
     transactions: Mapped[list["Transaction"]] = relationship("Transaction", back_populates="user")
     conversations: Mapped[list["AdvisorConversation"]] = relationship("AdvisorConversation", back_populates="user")
+    watchlist_items: Mapped[list["WatchlistItem"]] = relationship("WatchlistItem", back_populates="user", cascade="all, delete-orphan")
 
 
 class Account(Base):
@@ -124,6 +125,13 @@ class Transaction(Base):
 
     transacted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     settled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Dividend / distribution fields
+    tax_withheld: Mapped[Optional[Decimal]] = mapped_column(Numeric(28, 10), nullable=True)
+    dividend_per_share: Mapped[Optional[Decimal]] = mapped_column(Numeric(28, 10), nullable=True)
+    ex_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    franking_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 6), nullable=True)
+    franking_credit: Mapped[Optional[Decimal]] = mapped_column(Numeric(28, 10), nullable=True)
 
     # Corporate action fields
     split_ratio: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 6), nullable=True)
@@ -290,6 +298,29 @@ class ApiCredential(Base):
 
     __table_args__ = (
         UniqueConstraint("user_id", "provider", "credential_type"),
+    )
+
+
+class WatchlistItem(Base):
+    """Per-user watchlist for trading & market monitoring."""
+    __tablename__ = "watchlist_items"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    asset_class: Mapped[str] = mapped_column(String(30), nullable=False)  # EQUITY|CRYPTO|ETF
+    exchange: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    coingecko_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    image_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    user: Mapped["User"] = relationship("User", back_populates="watchlist_items")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "symbol"),
+        Index("ix_watchlist_user", "user_id"),
     )
 
 

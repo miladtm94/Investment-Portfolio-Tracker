@@ -87,7 +87,7 @@ class BrokerProfile:
 
 # Broker signatures: {frozenset_of_lowercase_columns: BrokerProfile}
 BROKER_SIGNATURES: list[tuple[set[str], BrokerProfile]] = [
-    # CommSec — has "Security Code" and "Brokerage ($)"
+    # CommSec (variant 1) — has "Security Code" and "Brokerage ($)"
     (
         {"security code", "brokerage ($)"},
         BrokerProfile(
@@ -107,24 +107,43 @@ BROKER_SIGNATURES: list[tuple[set[str], BrokerProfile]] = [
         ),
     ),
 
-    # CMC Invest — has "Stock Code" and "Brokerage"
+    # CommSec (variant 2) — has "Security" and "Brokerage (inc GST.)"
     (
-        {"stock code", "brokerage"},
+        {"security", "brokerage (inc gst.)"},
+        BrokerProfile(
+            name="CommSec",
+            default_currency="AUD",
+            column_map={
+                "date": "Trade Date",
+                "type": "Buy/ Sell",
+                "symbol": "Security",
+                "quantity": "Units",
+                "price": "Average Price ($)",
+                "fees": "Brokerage (inc GST.)",
+                "net_amount": "Net Proceeds ($)",
+                "notes": "Confirmation Number",
+            },
+            date_format="%d/%m/%Y",
+        ),
+    ),
+
+    # CMC Invest — has "AsxCode" and "Brokerage" (real export format)
+    (
+        {"asxcode", "brokerage"},
         BrokerProfile(
             name="CMC Invest",
             default_currency="AUD",
             column_map={
-                "date": "Date",
-                "type": "Type",
-                "symbol": "Stock Code",
+                "date": "Trade Date",
+                "type": "Order Type",
+                "symbol": "AsxCode",
                 "quantity": "Quantity",
                 "price": "Price",
                 "fees": "Brokerage",
-                "net_amount": "Net Amount",
-                "currency": "Currency",
-                "notes": "Stock Name",
+                "net_amount": "Consideration",
+                "notes": "Account Name",
             },
-            date_format="%d/%m/%Y",
+            date_format="%Y-%m-%d",
         ),
     ),
 
@@ -146,7 +165,7 @@ BROKER_SIGNATURES: list[tuple[set[str], BrokerProfile]] = [
                 "notes": "Description",
             },
             quantity_signed=True,  # negative qty = sell
-            date_format="%Y%m%d",
+            date_format=None,  # Auto-detect: supports %Y%m%d, %m/%d/%Y, etc.
         ),
     ),
 
@@ -170,23 +189,23 @@ BROKER_SIGNATURES: list[tuple[set[str], BrokerProfile]] = [
         ),
     ),
 
-    # Moomoo — has "Side" and "Platform Fee"
+    # Moomoo — Tax Documents export: has "Instrument Code", "Market Code", "Brokerage Currency"
     (
-        {"side", "platform fee"},
+        {"instrument code", "market code", "brokerage currency"},
         BrokerProfile(
             name="Moomoo",
             default_currency="USD",
             column_map={
-                "date": "Date",
-                "type": "Side",
-                "symbol": "Symbol",
+                "date": "Trade Date",
+                "type": "Transaction Type",
+                "symbol": "Instrument Code",
                 "quantity": "Quantity",
                 "price": "Price",
-                "fees": "Commission",
-                "net_amount": "Amount",
-                "currency": "Currency",
-                "notes": "Name",
+                "fees": "Brokerage",
+                "currency": "Brokerage Currency",
+                "notes": "Comments",
             },
+            date_format="%Y-%m-%d",
         ),
     ),
 
@@ -372,7 +391,7 @@ class TransactionImporter:
 
     def _detect_broker(self, sample_row: dict) -> BrokerProfile:
         """Identify broker from column names in the first row."""
-        cols_lower = {k.lower().strip() for k in sample_row.keys()}
+        cols_lower = {k.lower().strip() for k in sample_row.keys() if k is not None}
 
         for signature_cols, profile in BROKER_SIGNATURES:
             if signature_cols.issubset(cols_lower):
@@ -384,7 +403,7 @@ class TransactionImporter:
 
     def _resolve_column_casing(self, profile: BrokerProfile, sample_row: dict) -> BrokerProfile:
         """Match profile's expected columns to actual casing in the file."""
-        actual_keys = list(sample_row.keys())
+        actual_keys = [k for k in sample_row.keys() if k is not None]
         lower_to_actual = {k.lower().strip(): k for k in actual_keys}
 
         resolved_map = {}
@@ -419,11 +438,11 @@ class TransactionImporter:
             "price": ["price", "price per share", "unit price", "fill price", "avg price", "trade price", "spot price"],
             "fees": ["fees", "fee", "commission", "brokerage", "charges", "comm"],
             "currency": ["currency", "ccy", "quote currency", "currency primary"],
-            "net_amount": ["net amount", "total", "net", "proceeds", "value", "subtotal", "consideration", "net cash", "cost"],
+            "net_amount": ["net amount", "total", "net", "proceeds", "value", "subtotal", "consideration", "net cash", "cost", "amount", "cash amount"],
             "notes": ["notes", "description", "memo", "comment", "details", "reference", "name"],
         }
 
-        keys = list(sample_row.keys())
+        keys = [k for k in sample_row.keys() if k is not None]
         keys_lower = [k.lower().strip() for k in keys]
         mapping = {}
         used_keys = set()
@@ -538,6 +557,16 @@ class TransactionImporter:
         # ── Notes ──
         notes = get("notes")
 
+        # Fallback: infer income types from notes if type is ambiguous
+        if txn_type not in {
+            "BUY", "SELL", "DIVIDEND", "DISTRIBUTION", "INTEREST",
+            "TRANSFER_IN", "TRANSFER_OUT", "DEPOSIT", "WITHDRAWAL",
+            "STAKE_REWARD", "AIRDROP", "MINING_REWARD", "SWAP", "SPLIT", "FEE",
+        }:
+            note_lc = (notes or "").lower()
+            if "dividend" in note_lc or "distribution" in note_lc:
+                txn_type = "DIVIDEND"
+
         # ── Import hash ──
         hash_input = f"{txn_date.date()}|{txn_type}|{symbol}|{quantity}|{price}|{fees}"
         import_hash = hashlib.sha256(hash_input.encode()).hexdigest()
@@ -612,6 +641,9 @@ class TransactionImporter:
                     net_amount = qty * parsed.price
                     if parsed.transaction_type == "SELL":
                         net_amount = net_amount - parsed.fees
+                    elif parsed.transaction_type in ("DIVIDEND", "DISTRIBUTION", "INTEREST"):
+                        # Income events should be positive by default
+                        net_amount = net_amount
                     else:
                         net_amount = -(net_amount + parsed.fees)
 

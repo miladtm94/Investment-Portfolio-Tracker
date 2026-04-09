@@ -9,6 +9,18 @@ export const metadata: Metadata = {
   title: "InvestIQ — Investment Intelligence Platform",
   description: "Unified portfolio tracking, AI insights, and tax optimization for all your investments.",
   icons: { icon: "/favicon.ico" },
+  manifest: "/manifest.json",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "InvestIQ",
+  },
+  viewport: {
+    width: "device-width",
+    initialScale: 1,
+    maximumScale: 1,
+    userScalable: false,
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

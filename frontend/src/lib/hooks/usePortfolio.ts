@@ -15,6 +15,7 @@ export interface Holding {
   unrealized_gain?: number;
   unrealized_gain_pct?: number;
   currency: string;
+  original_currency?: string;
 }
 
 export interface PortfolioSummary {
@@ -30,13 +31,17 @@ export interface PortfolioSummary {
   as_of: string;
 }
 
-export function usePortfolioSummary(accountIds?: string[]) {
-  const params = accountIds?.length ? `?account_ids=${accountIds.join(",")}` : "";
+export function usePortfolioSummary(accountIds?: string[], currency: string = "AUD") {
+  const searchParams = new URLSearchParams();
+  if (accountIds?.length) searchParams.set("account_ids", accountIds.join(","));
+  if (currency && currency !== "AUD") searchParams.set("currency", currency);
+  const qs = searchParams.toString();
+  const url = `/portfolio/summary${qs ? `?${qs}` : ""}`;
   return useQuery<PortfolioSummary>({
-    queryKey: ["portfolio", "summary", accountIds],
-    queryFn: () => api.get(`/portfolio/summary${params}`).then((r) => r.data),
+    queryKey: ["portfolio", "summary", accountIds, currency],
+    queryFn: () => api.get(url).then((r) => r.data),
     staleTime: 30 * 1000,
-    refetchInterval: 60 * 1000, // Refresh every minute
+    refetchInterval: 60 * 1000,
   });
 }
 
@@ -47,10 +52,48 @@ export function useAccounts() {
   });
 }
 
-export function useNetWorth() {
+export function useNetWorth(currency: string = "AUD") {
+  const qs = currency && currency !== "AUD" ? `?currency=${currency}` : "";
   return useQuery({
-    queryKey: ["portfolio", "net-worth"],
-    queryFn: () => api.get("/portfolio/net-worth").then((r) => r.data),
+    queryKey: ["portfolio", "net-worth", currency],
+    queryFn: () => api.get(`/portfolio/net-worth${qs}`).then((r) => r.data),
     staleTime: 60 * 1000,
   });
 }
+
+export interface HoldingTransaction {
+  id: string;
+  account_id: string;
+  asset_id: string | null;
+  symbol: string | null;
+  transaction_type: string;
+  quantity: number | null;
+  price_per_unit: number | null;
+  fees: number;
+  gross_amount: number | null;
+  tax_withheld: number | null;
+  dividend_per_share: number | null;
+  net_amount: number | null;
+  currency: string;
+  fx_rate_to_aud: number | null;
+  net_amount_aud: number | null;
+  price_per_unit_aud: number | null;
+  ex_date: string | null;
+  franking_pct: number | null;
+  franking_credit: number | null;
+  transacted_at: string;
+  source: string;
+  notes: string | null;
+  created_at: string;
+}
+
+export function useHoldingTransactions(symbol: string | null) {
+  return useQuery<HoldingTransaction[]>({
+    queryKey: ["transactions", "holding", symbol],
+    queryFn: () =>
+      api.get(`/transactions/?asset_symbol=${symbol}&limit=200`).then((r) => r.data),
+    enabled: !!symbol,
+    staleTime: 60 * 1000,
+  });
+}
+

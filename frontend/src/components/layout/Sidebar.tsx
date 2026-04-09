@@ -6,15 +6,21 @@ import clsx from "clsx";
 import {
   LayoutDashboard, Briefcase, ArrowLeftRight, BarChart2,
   Bot, FileText, RefreshCw, Settings, TrendingUp, Zap, Upload, LogOut,
+  Globe, Star,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth/AuthContext";
 
-const NAV_ITEMS = [
-  { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { href: "/dashboard/transactions", label: "Investments", icon: ArrowLeftRight },
-  { href: "/dashboard/analytics", label: "Analytics", icon: BarChart2 },
-  { href: "/dashboard/advisor", label: "AI Advisor", icon: Bot },
-  { href: "/dashboard/tax", label: "Tax Center", icon: FileText },
+const INVEST_NAV = [
+  { href: "/dashboard",              label: "Dashboard",   icon: LayoutDashboard, badge: null },
+  { href: "/dashboard/transactions", label: "Investments", icon: ArrowLeftRight,  badge: null },
+  { href: "/dashboard/analytics",    label: "Analytics",   icon: BarChart2,       badge: null },
+  { href: "/dashboard/advisor",      label: "AI Advisor",  icon: Bot,             badge: "AI" },
+  { href: "/dashboard/tax",          label: "Tax Center",  icon: FileText,        badge: null },
+];
+
+const TRADING_NAV = [
+  { href: "/dashboard/markets",   label: "Markets",   icon: Globe, badge: null },
+  { href: "/dashboard/watchlist", label: "Watchlist", icon: Star,  badge: null },
 ];
 
 export function Sidebar() {
@@ -41,19 +47,28 @@ export function Sidebar() {
         <div className="text-xs font-medium text-gray-600 uppercase tracking-wider px-3 py-2">
           Portfolio
         </div>
-        {NAV_ITEMS.map(({ href, label, icon: Icon }) => {
+        {INVEST_NAV.map(({ href, label, icon: Icon, badge }) => {
           const isActive = pathname === href || (href !== "/dashboard" && pathname.startsWith(href));
           return (
-            <Link
-              key={href}
-              href={href}
-              className={clsx("sidebar-item", isActive && "sidebar-item-active")}
-            >
+            <Link key={href} href={href} className={clsx("sidebar-item", isActive && "sidebar-item-active")}>
               <Icon className="w-4 h-4 flex-shrink-0" />
               <span className="text-sm">{label}</span>
-              {label === "AI Advisor" && (
-                <span className="ml-auto text-xs bg-blue-600 text-white px-1.5 py-0.5 rounded-full">AI</span>
+              {badge && (
+                <span className="ml-auto text-xs bg-blue-600 text-white px-1.5 py-0.5 rounded-full">{badge}</span>
               )}
+            </Link>
+          );
+        })}
+
+        <div className="text-xs font-medium text-gray-600 uppercase tracking-wider px-3 py-2 mt-4">
+          Trading
+        </div>
+        {TRADING_NAV.map(({ href, label, icon: Icon }) => {
+          const isActive = pathname === href || pathname.startsWith(href);
+          return (
+            <Link key={href} href={href} className={clsx("sidebar-item", isActive && "sidebar-item-active")}>
+              <Icon className="w-4 h-4 flex-shrink-0" />
+              <span className="text-sm">{label}</span>
             </Link>
           );
         })}
