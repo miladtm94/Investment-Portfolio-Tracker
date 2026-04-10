@@ -15,7 +15,10 @@ from services.ai_advisor_service import AIAdvisorService
 from services.portfolio_engine import PortfolioEngine
 from services.analytics_engine import AnalyticsEngine
 from services.market_data_service import MarketDataService
-from services.tax_engine import TaxEngine
+try:
+    from services.tax_engine import TaxEngine
+except ImportError:
+    TaxEngine = None  # type: ignore
 
 router = APIRouter()
 
@@ -23,6 +26,7 @@ router = APIRouter()
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
+    provider: str = "gemini"  # "claude" | "openai" | "gemini" | "ollama" | "lmstudio"
 
 
 class ChatResponse(BaseModel):
@@ -65,6 +69,7 @@ async def chat(
         user=current_user,
         message=body.message,
         session_id=body.session_id,
+        provider=body.provider,
     )
     return ChatResponse(
         content=response.content,

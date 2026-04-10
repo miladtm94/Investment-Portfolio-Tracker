@@ -627,7 +627,10 @@ class TransactionImporter:
         for parsed in normalized:
             try:
                 existing = await self.db.execute(
-                    select(Transaction).where(Transaction.import_hash == parsed.import_hash)
+                    select(Transaction).where(
+                        Transaction.import_hash == parsed.import_hash,
+                        Transaction.account_id == account_id,
+                    )
                 )
                 if existing.scalar_one_or_none():
                     duplicates += 1

@@ -6,7 +6,7 @@ import clsx from "clsx";
 import {
   LayoutDashboard, Briefcase, ArrowLeftRight, BarChart2,
   Bot, FileText, RefreshCw, Settings, TrendingUp, Zap, Upload, LogOut,
-  Globe, Star,
+  Globe, Star, History,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth/AuthContext";
 
@@ -19,8 +19,9 @@ const INVEST_NAV = [
 ];
 
 const TRADING_NAV = [
-  { href: "/dashboard/markets",   label: "Markets",   icon: Globe, badge: null },
-  { href: "/dashboard/watchlist", label: "Watchlist", icon: Star,  badge: null },
+  { href: "/dashboard/markets",          label: "Markets",        icon: Globe,    badge: null },
+  { href: "/dashboard/watchlist",        label: "Watchlist",      icon: Star,     badge: null },
+  { href: "/dashboard/analysis/history", label: "AI History",     icon: History,  badge: null },
 ];
 
 export function Sidebar() {

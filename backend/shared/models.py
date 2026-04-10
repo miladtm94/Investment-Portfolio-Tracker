@@ -337,3 +337,43 @@ class BackgroundJob(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AnalysisResult(Base):
+    """Tracks every AI analysis run — enables feedback loop, win rate tracking, and RAG."""
+    __tablename__ = "analysis_results"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+
+    # ── What was analysed ─────────────────────────────────────────────────────
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    asset_class: Mapped[str] = mapped_column(String(20), nullable=False)  # EQUITY|CRYPTO|ETF
+    provider: Mapped[str] = mapped_column(String(20), nullable=False)     # claude|openai|gemini|ollama
+    horizon: Mapped[str] = mapped_column(String(20), nullable=False)      # trading|investing
+
+    # ── AI recommendation ─────────────────────────────────────────────────────
+    rec: Mapped[str] = mapped_column(String(20), nullable=False)          # STRONG BUY|BUY|HOLD|SELL|STRONG SELL
+    score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    confidence: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    target: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
+    stop_loss: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
+    entry_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
+    agent_scores: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True) # full analysis JSON
+
+    # ── Outcome tracking (filled in later by user) ────────────────────────────
+    outcome_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
+    outcome_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome_pnl_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4), nullable=True)
+    outcome_correct: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    outcome_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_analysis_results_user_id", "user_id"),
+        Index("ix_analysis_results_symbol", "symbol"),
+        Index("ix_analysis_results_created_at", "created_at"),
+    )

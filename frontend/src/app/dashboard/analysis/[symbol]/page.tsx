@@ -3,83 +3,107 @@
 import { useState } from "react";
 import { useParams, useSearchParams, useRouter } from "next/navigation";
 import {
-  ArrowLeft, Zap, TrendingUp, BarChart2, Newspaper,
-  ShieldAlert, Star, ChevronDown,
+  ArrowLeft, TrendingUp, TrendingDown, BarChart2, Newspaper,
+  ShieldAlert, Star, LayoutTemplate, Target, Brain, Globe,
+  Activity, Clock, CheckCircle2, XCircle, Calendar, ChevronRight,
+  ArrowUpRight, ArrowDownRight, Minus,
 } from "lucide-react";
 import {
-  useAnalyzeAsset,
-  useAddToWatchlist,
-  useWatchlist,
-  useRemoveFromWatchlist,
-  type Provider,
-  type Horizon,
-  type AnalysisResult,
-  type AssetClass,
+  useAnalyzeAsset, useAddToWatchlist, useWatchlist,
+  useRemoveFromWatchlist, useOllamaStatus, useLMStudioStatus,
+  type Provider, type Horizon, type AnalysisResult, type AssetClass,
 } from "@/lib/hooks/useTrading";
 import { formatCurrency } from "@/lib/utils/formatters";
+import TradingViewChart, { INTERVALS, type TVInterval } from "@/components/charts/TradingViewChart";
+import Link from "next/link";
+import clsx from "clsx";
 
-// ─── Sub-components ───────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
-const REC_STYLES: Record<string, { bg: string; text: string; border: string }> = {
-  "STRONG BUY": { bg: "bg-emerald-950", text: "text-emerald-400", border: "border-emerald-700" },
-  BUY:          { bg: "bg-emerald-950/60", text: "text-emerald-500", border: "border-emerald-800" },
-  HOLD:         { bg: "bg-amber-950/60",   text: "text-amber-400",   border: "border-amber-700"   },
-  SELL:         { bg: "bg-red-950/60",     text: "text-red-400",     border: "border-red-800"     },
-  "STRONG SELL":{ bg: "bg-red-950",       text: "text-red-400",     border: "border-red-700"     },
+const REC_CONFIG: Record<string, { bg: string; text: string; border: string; icon: React.ReactNode }> = {
+  "STRONG BUY": { bg: "bg-emerald-950",    text: "text-emerald-300", border: "border-emerald-600", icon: <ArrowUpRight className="w-5 h-5" /> },
+  "BUY":        { bg: "bg-emerald-950/50", text: "text-emerald-400", border: "border-emerald-800", icon: <ArrowUpRight className="w-5 h-5" /> },
+  "HOLD":       { bg: "bg-amber-950/50",   text: "text-amber-400",   border: "border-amber-700",   icon: <Minus className="w-5 h-5" /> },
+  "SELL":       { bg: "bg-red-950/50",     text: "text-red-400",     border: "border-red-800",     icon: <ArrowDownRight className="w-5 h-5" /> },
+  "STRONG SELL":{ bg: "bg-red-950",        text: "text-red-300",     border: "border-red-600",     icon: <ArrowDownRight className="w-5 h-5" /> },
 };
 
-function RecBadge({ rec }: { rec: string }) {
-  const s = REC_STYLES[rec] ?? REC_STYLES["HOLD"];
+function scoreColor(s: number) {
+  if (s >= 70) return "#10b981";
+  if (s >= 45) return "#f59e0b";
+  return "#ef4444";
+}
+
+function ScoreRing({ score }: { score: number }) {
+  const size = 80;
+  const r = (size - 10) / 2;
+  const circ = 2 * Math.PI * r;
+  const fill = (score / 100) * circ;
+  const col = scoreColor(score);
   return (
-    <span className={`px-4 py-1.5 rounded-full text-sm font-bold border tracking-wider ${s.bg} ${s.text} ${s.border}`}>
-      {rec}
+    <div className="relative flex-shrink-0" style={{ width: size, height: size }}>
+      <svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#1f2937" strokeWidth="6" />
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={col} strokeWidth="6"
+          strokeDasharray={`${fill} ${circ - fill}`} strokeLinecap="round"
+          style={{ transition: "stroke-dasharray 1.2s ease" }} />
+      </svg>
+      <div className="absolute inset-0 flex flex-col items-center justify-center">
+        <span className="font-mono text-lg font-bold" style={{ color: col }}>{score}</span>
+        <span className="text-[9px] text-gray-500 uppercase tracking-widest">score</span>
+      </div>
+    </div>
+  );
+}
+
+function AgentScoreBar({ label, score, color }: { label: string; score?: number; color: string }) {
+  if (score == null) return null;
+  return (
+    <div className="flex items-center gap-3">
+      <span className="text-xs text-gray-500 w-14 flex-shrink-0">{label}</span>
+      <div className="flex-1 bg-gray-800 rounded-full h-1.5 overflow-hidden">
+        <div className={`h-full rounded-full transition-all duration-700 ${color}`} style={{ width: `${score}%` }} />
+      </div>
+      <span className="text-xs font-mono text-gray-400 w-7 text-right">{score}</span>
+    </div>
+  );
+}
+
+function SentimentBadge({ sentiment }: { sentiment?: string }) {
+  if (!sentiment) return null;
+  const map: Record<string, string> = {
+    BULLISH: "text-emerald-400 bg-emerald-400/10 border-emerald-500/20",
+    BEARISH: "text-red-400 bg-red-400/10 border-red-500/20",
+    MIXED:   "text-amber-400 bg-amber-400/10 border-amber-500/20",
+    NEUTRAL: "text-gray-400 bg-gray-400/10 border-gray-500/20",
+  };
+  return (
+    <span className={`text-xs font-medium px-2 py-0.5 rounded border ${map[sentiment] ?? map.NEUTRAL}`}>
+      {sentiment}
     </span>
   );
 }
 
-function ScoreRing({ score }: { score: number }) {
-  const size = 72;
-  const r = (size - 8) / 2;
-  const circ = 2 * Math.PI * r;
-  const fill = (score / 100) * circ;
-  const col = score >= 70 ? "#10b981" : score >= 45 ? "#f59e0b" : "#ef4444";
+function Panel({ title, icon, children, accent }: {
+  title: string; icon: React.ReactNode; children: React.ReactNode; accent?: string;
+}) {
   return (
-    <div className="relative" style={{ width: size, height: size }}>
-      <svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
-        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="#1f2937" strokeWidth="5" />
-        <circle
-          cx={size / 2} cy={size / 2} r={r} fill="none"
-          stroke={col} strokeWidth="5"
-          strokeDasharray={`${fill} ${circ - fill}`}
-          strokeLinecap="round"
-          style={{ transition: "stroke-dasharray 1s ease" }}
-        />
-      </svg>
-      <div className="absolute inset-0 flex items-center justify-center font-mono text-base font-semibold" style={{ color: col }}>
-        {score}
-      </div>
-    </div>
-  );
-}
-
-function Section({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {
-  return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-      <div className="flex items-center gap-2 mb-3">
+    <div className={`bg-gray-900 border rounded-xl overflow-hidden ${accent ?? "border-gray-800"}`}>
+      <div className={`flex items-center gap-2.5 px-5 py-3.5 border-b ${accent ? accent.replace("border-", "border-b-") : "border-b-gray-800"}`}>
         <span className="text-blue-400">{icon}</span>
-        <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">{title}</h3>
+        <h3 className="text-xs font-semibold text-gray-300 uppercase tracking-widest">{title}</h3>
       </div>
-      {children}
+      <div className="p-5">{children}</div>
     </div>
   );
 }
 
-function TagList({ items, color }: { items: string[]; color: string }) {
+function Bullet({ items, color }: { items: string[]; color: string }) {
   return (
-    <ul className="space-y-1.5">
+    <ul className="space-y-2">
       {items.map((item, i) => (
-        <li key={i} className="flex items-start gap-2 text-sm text-gray-300">
-          <span className={`mt-1 w-1.5 h-1.5 rounded-full flex-shrink-0 ${color}`} />
+        <li key={i} className="flex items-start gap-2.5 text-sm text-gray-300 leading-relaxed">
+          <span className={`mt-1.5 w-1.5 h-1.5 rounded-full flex-shrink-0 ${color}`} />
           {item}
         </li>
       ))}
@@ -87,291 +111,473 @@ function TagList({ items, color }: { items: string[]; color: string }) {
   );
 }
 
-function LevelPills({ levels, color }: { levels: number[]; color: string }) {
+function PriceTag({ label, value, sub, accent }: { label: string; value?: number | null; sub?: string; accent?: string }) {
   return (
-    <div className="flex flex-wrap gap-2">
-      {levels.map((l, i) => (
-        <span key={i} className={`font-mono text-xs px-2.5 py-1 rounded border ${color}`}>
-          {formatCurrency(l, false, "USD")}
-        </span>
-      ))}
+    <div className={`rounded-lg p-3 border ${accent ?? "bg-gray-800/40 border-gray-700/50"}`}>
+      <div className="text-xs text-gray-500 mb-1">{label}</div>
+      <div className="font-mono text-sm font-semibold text-gray-100">
+        {value != null ? formatCurrency(value, false, "USD") : "—"}
+      </div>
+      {sub && <div className="text-[10px] text-gray-600 mt-0.5">{sub}</div>}
     </div>
   );
 }
 
-function ProviderBadge({ provider }: { provider: Provider }) {
-  const map: Record<Provider, string> = {
-    claude: "bg-amber-500/10 text-amber-400 border-amber-500/20",
-    openai: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
-    gemini: "bg-blue-500/10 text-blue-400 border-blue-500/20",
-  };
-  const label: Record<Provider, string> = { claude: "Claude", openai: "GPT-4o", gemini: "Gemini" };
-  return (
-    <span className={`text-xs font-medium px-2 py-0.5 rounded border ${map[provider]}`}>
-      {label[provider]}
-    </span>
-  );
-}
-
-function HorizonBadge({ horizon }: { horizon: Horizon }) {
-  return horizon === "trading" ? (
-    <span className="text-xs font-medium px-2 py-0.5 rounded border bg-purple-500/10 text-purple-400 border-purple-500/20">
-      Trading · Short/Mid Term
-    </span>
-  ) : (
-    <span className="text-xs font-medium px-2 py-0.5 rounded border bg-teal-500/10 text-teal-400 border-teal-500/20">
-      Investing · Mid/Long Term
-    </span>
-  );
-}
-
-// ─── Main Page ────────────────────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 export default function AnalysisPage() {
   const params = useParams();
   const sp = useSearchParams();
   const router = useRouter();
 
-  const symbol = (params.symbol as string).toUpperCase();
-  const name = sp.get("name") ?? symbol;
-  const assetClass = (sp.get("asset_class") ?? "EQUITY") as AssetClass;
-  const exchange = sp.get("exchange") ?? undefined;
+  const symbol      = (params.symbol as string).toUpperCase();
+  const name        = sp.get("name") ?? symbol;
+  const assetClass  = (sp.get("asset_class") ?? "EQUITY") as AssetClass;
+  const exchange    = sp.get("exchange") ?? undefined;
   const coingeckoId = sp.get("coingecko_id") ?? undefined;
 
-  const [horizon, setHorizon] = useState<Horizon>("trading");
-  const [provider, setProvider] = useState<Provider>("claude");
-  const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [horizon, setHorizon]   = useState<Horizon>("trading");
+  const [provider, setProvider] = useState<Provider>("gemini");
+  const [interval, setInterval] = useState<TVInterval>("D");
+  const [result, setResult]     = useState<AnalysisResult | null>(null);
+  const [asOfDate, setAsOfDate] = useState<string>("");   // "" = now, "YYYY-MM-DD" = historical
 
-  const analyze = useAnalyzeAsset();
+  const analyze      = useAnalyzeAsset();
+  const { data: ollamaStatus }   = useOllamaStatus();
+  const { data: lmStudioStatus } = useLMStudioStatus();
   const { data: watchlist = [] } = useWatchlist();
-  const addWatch = useAddToWatchlist();
-  const removeWatch = useRemoveFromWatchlist();
-  const inWatchlist = watchlist.some((w) => w.symbol === symbol);
+  const addWatch     = useAddToWatchlist();
+  const removeWatch  = useRemoveFromWatchlist();
+  const inWatchlist  = watchlist.some((w) => w.symbol === symbol);
+
+  const today = new Date().toISOString().split("T")[0];
+  const isHistorical = !!asOfDate && asOfDate !== today;
 
   const handleAnalyze = () => {
     analyze.mutate(
-      { symbol, name, asset_class: assetClass, exchange, coingecko_id: coingeckoId, horizon, provider },
+      {
+        symbol, name, asset_class: assetClass, exchange, coingecko_id: coingeckoId,
+        horizon, provider,
+        as_of_date: asOfDate || null,
+      },
       { onSuccess: (data) => setResult(data) }
     );
   };
 
   const toggleWatch = () => {
-    if (inWatchlist) {
-      removeWatch.mutate(symbol);
-    } else {
-      addWatch.mutate({ symbol, name, asset_class: assetClass, exchange, coingecko_id: coingeckoId });
-    }
+    if (inWatchlist) removeWatch.mutate(symbol);
+    else addWatch.mutate({ symbol, name, asset_class: assetClass, exchange, coingecko_id: coingeckoId });
   };
 
+  // Derived display
+  const rec = result?.rec ?? "HOLD";
+  const recCfg = REC_CONFIG[rec] ?? REC_CONFIG["HOLD"];
+  const riskReward = result
+    ? ((result.target - (result.stopLoss ?? 0)) / ((result.stopLoss ?? 0) - (result.targetLow ?? result.target)))
+    : null;
+
   return (
-    <div className="p-6 max-w-5xl mx-auto space-y-6">
+    <div className="p-6 max-w-7xl mx-auto space-y-5">
+
       {/* Back */}
-      <button
-        onClick={() => router.back()}
-        className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-300 transition-colors"
-      >
+      <button onClick={() => router.back()}
+        className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-300 transition-colors">
         <ArrowLeft className="w-4 h-4" /> Back
       </button>
 
-      {/* Asset header */}
+      {/* ── Asset header ── */}
       <div className="flex items-center justify-between flex-wrap gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-100">{name}</h1>
-          <div className="flex items-center gap-2 mt-1">
+          <div className="flex items-center gap-2 mt-1 flex-wrap">
             <span className="font-mono text-sm text-gray-400 bg-gray-800 px-2 py-0.5 rounded">{symbol}</span>
-            {exchange && <span className="text-xs text-gray-600">{exchange}</span>}
+            {exchange && <span className="text-xs text-gray-500">{exchange}</span>}
+            <span className="text-xs text-gray-600 bg-gray-800/60 px-2 py-0.5 rounded">{assetClass}</span>
           </div>
         </div>
-        <button
-          onClick={toggleWatch}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg border text-sm font-medium transition-colors ${
-            inWatchlist
-              ? "bg-amber-500/10 text-amber-400 border-amber-500/20 hover:bg-amber-500/20"
-              : "bg-gray-800 text-gray-400 border-gray-700 hover:border-amber-500/40 hover:text-amber-400"
-          }`}
-        >
-          <Star className="w-4 h-4" fill={inWatchlist ? "currentColor" : "none"} />
-          {inWatchlist ? "In Watchlist" : "Add to Watchlist"}
-        </button>
+        <div className="flex items-center gap-2">
+          <Link href="/dashboard/analysis/history"
+            className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-300 border border-gray-700 hover:border-gray-600 px-3 py-1.5 rounded-lg transition-colors">
+            <Clock className="w-3.5 h-3.5" /> Analysis History
+          </Link>
+          <button onClick={toggleWatch}
+            className={clsx("flex items-center gap-2 px-4 py-2 rounded-lg border text-sm font-medium transition-colors",
+              inWatchlist
+                ? "bg-amber-500/10 text-amber-400 border-amber-500/20 hover:bg-amber-500/20"
+                : "bg-gray-800 text-gray-400 border-gray-700 hover:border-amber-500/40 hover:text-amber-400"
+            )}>
+            <Star className="w-4 h-4" fill={inWatchlist ? "currentColor" : "none"} />
+            {inWatchlist ? "In Watchlist" : "Add to Watchlist"}
+          </button>
+        </div>
       </div>
 
-      {/* Controls */}
+      {/* ── TradingView Chart ── */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-gray-800">
+          <div className="flex items-center gap-2 text-xs text-gray-500">
+            <LayoutTemplate className="w-3.5 h-3.5" />
+            <span>TradingView · Live Candlestick Chart</span>
+          </div>
+          <div className="flex items-center gap-1">
+            {INTERVALS.map(({ label, value }) => (
+              <button key={value} onClick={() => setInterval(value)}
+                className={clsx("px-2.5 py-1 rounded text-xs font-medium transition-colors",
+                  interval === value ? "bg-blue-600 text-white" : "text-gray-500 hover:text-gray-300 hover:bg-gray-800"
+                )}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <TradingViewChart symbol={symbol} assetClass={assetClass} exchange={exchange} interval={interval} height={500} />
+      </div>
+
+      {/* ── Analysis Controls ── */}
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-        <div className="flex items-center gap-2 mb-4">
-          <Zap className="w-4 h-4 text-amber-400" />
-          <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">AI Analysis</h2>
-          <span className="text-xs text-gray-600 ml-1">— Powered by Claude · GPT-4o · Gemini</span>
+        <div className="flex items-center gap-2 mb-5">
+          <Brain className="w-4 h-4 text-amber-400" />
+          <h2 className="text-sm font-semibold text-gray-200 uppercase tracking-widest">AI Analysis Engine</h2>
+          <span className="text-xs text-gray-600">· multi-agent · grounded in live market data</span>
+          {ollamaStatus?.available && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded border bg-violet-900/30 text-violet-400 border-violet-700">
+              Local Ollama ready
+            </span>
+          )}
         </div>
 
-        <div className="flex flex-wrap gap-4 items-end">
-          {/* Horizon */}
+        <div className="flex flex-wrap gap-5 items-end">
+
+          {/* Strategy */}
           <div className="flex flex-col gap-1.5">
             <label className="text-xs text-gray-500 uppercase tracking-wider">Strategy</label>
             <div className="flex bg-gray-800 rounded-lg p-1 gap-1">
               {(["trading", "investing"] as Horizon[]).map((h) => (
-                <button
-                  key={h}
-                  onClick={() => setHorizon(h)}
-                  className={`px-4 py-1.5 rounded text-sm font-medium transition-colors capitalize ${
+                <button key={h} onClick={() => setHorizon(h)}
+                  className={clsx("px-4 py-1.5 rounded text-sm font-medium transition-colors",
                     horizon === h ? "bg-blue-600 text-white" : "text-gray-400 hover:text-gray-200"
-                  }`}
-                >
+                  )}>
                   {h === "trading" ? "⚡ Trading" : "📈 Investing"}
                 </button>
               ))}
             </div>
           </div>
 
+          {/* Analysis Date */}
+          <div className="flex flex-col gap-1.5">
+            <label className="text-xs text-gray-500 uppercase tracking-wider flex items-center gap-1.5">
+              <Calendar className="w-3 h-3" />
+              Analysis Date
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="date"
+                value={asOfDate}
+                max={today}
+                onChange={(e) => setAsOfDate(e.target.value)}
+                className="bg-gray-800 border border-gray-700 text-sm text-gray-200 rounded-lg px-3 py-1.5 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30"
+              />
+              {asOfDate && (
+                <button onClick={() => setAsOfDate("")}
+                  className="text-xs text-gray-500 hover:text-gray-300 border border-gray-700 rounded px-2 py-1.5">
+                  Now
+                </button>
+              )}
+            </div>
+            {isHistorical && (
+              <p className="text-[11px] text-amber-500">
+                Historical mode — data up to {asOfDate} only
+              </p>
+            )}
+          </div>
+
           {/* Provider */}
           <div className="flex flex-col gap-1.5">
             <label className="text-xs text-gray-500 uppercase tracking-wider">AI Provider</label>
-            <div className="flex bg-gray-800 rounded-lg p-1 gap-1">
-              {(["claude", "openai", "gemini"] as Provider[]).map((p) => (
-                <button
-                  key={p}
-                  onClick={() => setProvider(p)}
-                  className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
+            <div className="flex bg-gray-800 rounded-lg p-1 gap-1 flex-wrap">
+              {(["gemini", "claude", "openai"] as Provider[]).map((p) => (
+                <button key={p} onClick={() => setProvider(p)}
+                  className={clsx("px-3 py-1.5 rounded text-sm font-medium transition-colors",
                     provider === p ? "bg-blue-600 text-white" : "text-gray-400 hover:text-gray-200"
-                  }`}
-                >
-                  {p === "claude" ? "Claude" : p === "openai" ? "GPT-4o" : "Gemini ✦ Free"}
+                  )}>
+                  {p === "claude" ? "Claude" : p === "openai" ? "GPT-4o" : "Gemini ✦"}
                 </button>
               ))}
+              <button onClick={() => setProvider("ollama")} disabled={!ollamaStatus?.available}
+                title={ollamaStatus?.available
+                  ? `Ollama · ${ollamaStatus.models.join(", ")}`
+                  : "Ollama not running — start with: ollama serve"}
+                className={clsx("px-3 py-1.5 rounded text-sm font-medium transition-colors flex items-center gap-1.5",
+                  provider === "ollama"
+                    ? "bg-violet-600 text-white"
+                    : ollamaStatus?.available
+                    ? "text-violet-400 hover:text-violet-200 hover:bg-violet-900/30"
+                    : "text-gray-700 cursor-not-allowed"
+                )}>
+                <span className={clsx("w-1.5 h-1.5 rounded-full", ollamaStatus?.available ? "bg-violet-400" : "bg-gray-700")} />
+                Ollama
+              </button>
+              <button onClick={() => setProvider("lmstudio")} disabled={!lmStudioStatus?.available}
+                title={lmStudioStatus?.available
+                  ? `LM Studio · ${lmStudioStatus.active_model ?? lmStudioStatus.models[0]}`
+                  : "LM Studio server not running — enable in LM Studio → Local Server tab"}
+                className={clsx("px-3 py-1.5 rounded text-sm font-medium transition-colors flex items-center gap-1.5",
+                  provider === "lmstudio"
+                    ? "bg-teal-600 text-white"
+                    : lmStudioStatus?.available
+                    ? "text-teal-400 hover:text-teal-200 hover:bg-teal-900/30"
+                    : "text-gray-700 cursor-not-allowed"
+                )}>
+                <span className={clsx("w-1.5 h-1.5 rounded-full", lmStudioStatus?.available ? "bg-teal-400" : "bg-gray-700")} />
+                LM Studio
+              </button>
             </div>
           </div>
 
           {/* Run button */}
-          <button
-            onClick={handleAnalyze}
-            disabled={analyze.isPending}
-            className="px-6 py-2.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-black font-bold rounded-lg text-sm transition-all disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-2"
-          >
+          <button onClick={handleAnalyze} disabled={analyze.isPending}
+            className="px-7 py-2.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500
+              text-black font-bold rounded-lg text-sm transition-all disabled:opacity-60 disabled:cursor-not-allowed
+              flex items-center gap-2">
             {analyze.isPending ? (
               <>
                 <span className="w-4 h-4 border-2 border-black/30 border-t-black rounded-full animate-spin" />
                 Analyzing…
               </>
             ) : (
-              <>{result ? "↻ Re-analyze" : "✦ Analyze Now"}</>
+              <>{result ? "↻ Re-Analyze" : "✦ Run Analysis"}</>
             )}
           </button>
         </div>
 
         {analyze.isError && (
-          <p className="mt-3 text-sm text-red-400">
+          <div className="mt-4 flex items-start gap-2 text-sm text-red-400 bg-red-400/5 border border-red-400/20 rounded-lg px-4 py-3">
+            <ShieldAlert className="w-4 h-4 flex-shrink-0 mt-0.5" />
             {(analyze.error as Error)?.message ?? "Analysis failed — please try again."}
-          </p>
+          </div>
         )}
       </div>
 
-      {/* Loading */}
+      {/* ── Loading State ── */}
       {analyze.isPending && (
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-16 text-center">
-          <div className="w-10 h-10 border-3 border-gray-700 border-t-amber-400 rounded-full animate-spin mx-auto mb-4" style={{ borderWidth: 3 }} />
-          <p className="text-gray-300 font-medium mb-1">Running deep analysis…</p>
-          <p className="text-gray-600 text-sm">Searching news · Analyzing {horizon === "trading" ? "technicals & momentum" : "fundamentals & valuation"}</p>
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-12 text-center">
+          <div className="relative w-16 h-16 mx-auto mb-6">
+            <div className="absolute inset-0 border-4 border-gray-800 rounded-full" />
+            <div className="absolute inset-0 border-4 border-t-amber-400 border-r-transparent border-b-transparent border-l-transparent rounded-full animate-spin" />
+            <Brain className="w-6 h-6 text-amber-400/60 absolute inset-0 m-auto" />
+          </div>
+          <p className="text-gray-200 font-semibold text-lg mb-2">Running multi-agent analysis…</p>
+          <div className="text-gray-500 text-sm space-y-1">
+            <p>Technical Agent · News Agent · Fundamental Agent running in parallel</p>
+            <p className="text-gray-600">Synthesis Agent compiling final recommendation</p>
+            {isHistorical && <p className="text-amber-600">Historical mode — data up to {asOfDate}</p>}
+          </div>
         </div>
       )}
 
-      {/* Results */}
+      {/* ── Empty State ── */}
+      {!result && !analyze.isPending && !analyze.isError && (
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-12 text-center">
+          <Brain className="w-14 h-14 text-gray-800 mx-auto mb-4" />
+          <p className="text-gray-400 font-medium mb-2">No analysis yet</p>
+          <p className="text-gray-600 text-sm max-w-md mx-auto">
+            Select a strategy, optionally pick a historical date, then click{" "}
+            <strong className="text-gray-400">Run Analysis</strong>.
+            The multi-agent pipeline will analyze chart data, news, and fundamentals.
+          </p>
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════
+          RESULTS
+      ══════════════════════════════════════════════════════════════ */}
       {result && !analyze.isPending && (
         <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-300">
-          {/* Top card: score + rec + summary */}
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
+
+          {/* ── Historical banner ── */}
+          {result._as_of_date && (
+            <div className="flex items-center gap-3 px-4 py-3 bg-amber-500/5 border border-amber-500/20 rounded-xl">
+              <Calendar className="w-4 h-4 text-amber-400 flex-shrink-0" />
+              <div className="flex-1 text-sm">
+                <span className="text-amber-300 font-medium">Historical Analysis</span>
+                <span className="text-amber-500/70 ml-2">
+                  Based on data available up to <strong className="text-amber-400">{result._as_of_date}</strong>.
+                  Entry price at analysis date: <strong className="font-mono text-amber-400">
+                    {result._entry_price ? formatCurrency(result._entry_price, false, "USD") : "—"}
+                  </strong>
+                </span>
+              </div>
+              {result._analysis_id && (
+                <Link href="/dashboard/analysis/history"
+                  className="text-xs text-amber-400 hover:text-amber-300 border border-amber-500/30 rounded-lg px-3 py-1.5 flex items-center gap-1 flex-shrink-0 hover:bg-amber-500/10 transition-colors">
+                  Record outcome <ChevronRight className="w-3 h-3" />
+                </Link>
+              )}
+            </div>
+          )}
+
+          {/* ── Row 1: Executive Summary ── */}
+          <div className={clsx("rounded-xl border p-6", recCfg.bg, recCfg.border)}>
             <div className="flex items-start gap-6 flex-wrap">
+
+              {/* Score */}
               <ScoreRing score={result.score} />
+
+              {/* Rec + badges */}
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-3 flex-wrap mb-3">
-                  <RecBadge rec={result.rec} />
-                  <span className="text-sm text-gray-500">Confidence: <span className="text-gray-300 font-medium">{result.confidence}</span></span>
-                  <span className="text-sm text-gray-500">Horizon: <span className="text-gray-300 font-medium">{result.horizon}</span></span>
-                  <ProviderBadge provider={result._provider} />
-                  <HorizonBadge horizon={result._horizon} />
+                  <span className={clsx("flex items-center gap-1.5 px-4 py-1.5 rounded-full text-base font-bold border tracking-widest", recCfg.bg, recCfg.text, recCfg.border)}>
+                    {recCfg.icon} {rec}
+                  </span>
+                  <span className="text-sm text-gray-400">
+                    Confidence: <span className={clsx("font-semibold", result.confidence === "High" ? "text-emerald-400" : result.confidence === "Low" ? "text-red-400" : "text-amber-400")}>
+                      {result.confidence}
+                    </span>
+                  </span>
+                  <span className="text-xs px-2 py-0.5 rounded border bg-gray-800/60 text-gray-400 border-gray-700">
+                    {horizon === "trading" ? "⚡ Trading" : "📈 Investing"} · {result.horizon}
+                  </span>
+                  <span className={clsx("text-xs font-medium px-2 py-0.5 rounded border",
+                    provider === "claude"  ? "bg-amber-500/10 text-amber-400 border-amber-500/20" :
+                    provider === "openai" ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" :
+                    provider === "ollama" ? "bg-violet-500/10 text-violet-400 border-violet-500/20" :
+                    "bg-blue-500/10 text-blue-400 border-blue-500/20"
+                  )}>
+                    {provider === "claude" ? "Claude" : provider === "openai" ? "GPT-4o" : provider === "ollama" ? "Local · Ollama" : "Gemini"}
+                  </span>
                 </div>
-                <p className="text-gray-300 text-sm leading-relaxed">{result.summary}</p>
+                <p className="text-gray-200 text-sm leading-relaxed">{result.summary}</p>
               </div>
-            </div>
 
-            {/* Price levels */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-6 pt-5 border-t border-gray-800">
-              {[
-                { label: "Target Low", value: result.targetLow },
-                { label: "Target", value: result.target },
-                { label: "Target High", value: result.targetHigh },
-                { label: "Stop Loss", value: result.stopLoss },
-              ].map(({ label, value }) => (
-                <div key={label}>
-                  <div className="text-xs text-gray-600 mb-1">{label}</div>
-                  <div className="font-mono text-sm font-semibold text-gray-200">
-                    {formatCurrency(value, false, "USD")}
-                  </div>
+              {/* Agent scores */}
+              {result._agent_scores && (
+                <div className="flex-shrink-0 w-48 space-y-2 pt-1">
+                  <p className="text-[10px] text-gray-600 uppercase tracking-widest mb-2">Agent Scores</p>
+                  <AgentScoreBar label="Technical" score={result._agent_scores.tech} color="bg-blue-500" />
+                  <AgentScoreBar label="News" score={result._agent_scores.news} color="bg-purple-500" />
+                  <AgentScoreBar label="Fundamental" score={result._agent_scores.fund} color="bg-teal-500" />
                 </div>
-              ))}
+              )}
             </div>
-
-            <div className="mt-4 grid grid-cols-2 gap-4">
-              <div>
-                <div className="text-xs text-gray-600 mb-1">Entry Zone</div>
-                <div className="text-sm text-gray-300">{result.entryZone}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-600 mb-1">Suggested Allocation</div>
-                <div className="text-sm text-gray-300">{result.allocation}</div>
-              </div>
-            </div>
-
-            {result.strategyNote && (
-              <div className="mt-4 p-3 bg-blue-950/30 border border-blue-900/40 rounded-lg">
-                <p className="text-xs text-blue-300 leading-relaxed">{result.strategyNote}</p>
-              </div>
-            )}
           </div>
 
-          {/* Support / Resistance */}
+          {/* ── Row 2: Price Map ── */}
+          <Panel title="Price Map & Trade Plan" icon={<Target className="w-4 h-4" />}>
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-5">
+              <PriceTag label="Entry Zone" value={undefined} sub={result.entryZone}
+                accent="bg-blue-950/30 border-blue-800/40" />
+              <PriceTag label="Target Low" value={result.targetLow}
+                accent="bg-emerald-950/20 border-emerald-900/30" />
+              <PriceTag label="Target" value={result.target}
+                accent="bg-emerald-950/40 border-emerald-700/40" />
+              <PriceTag label="Target High" value={result.targetHigh}
+                accent="bg-emerald-950/60 border-emerald-600/50" />
+              <PriceTag label="Stop Loss" value={result.stopLoss}
+                accent="bg-red-950/30 border-red-800/40" />
+              <div className="rounded-lg p-3 border bg-gray-800/40 border-gray-700/50">
+                <div className="text-xs text-gray-500 mb-1">R/R Ratio</div>
+                <div className={clsx("font-mono text-sm font-semibold",
+                  riskReward && riskReward > 2 ? "text-emerald-400" : riskReward && riskReward < 1 ? "text-red-400" : "text-amber-400"
+                )}>
+                  {riskReward && isFinite(riskReward) ? `${riskReward.toFixed(1)}:1` : "—"}
+                </div>
+                <div className="text-[10px] text-gray-600 mt-0.5">Risk / Reward</div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <div className="text-xs text-gray-500 mb-2">Suggested Allocation</div>
+                <p className="text-sm text-gray-300">{result.allocation}</p>
+              </div>
+              {result.strategyNote && (
+                <div>
+                  <div className="text-xs text-gray-500 mb-2">Strategy Note</div>
+                  <p className="text-sm text-gray-400 leading-relaxed">{result.strategyNote}</p>
+                </div>
+              )}
+            </div>
+          </Panel>
+
+          {/* ── Row 3: Key Levels ── */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <Section icon={<TrendingUp className="w-4 h-4" />} title="Support Levels">
-              <LevelPills levels={result.support} color="bg-emerald-500 border-emerald-700/60 text-emerald-400" />
-            </Section>
-            <Section icon={<TrendingUp className="w-4 h-4 rotate-180" />} title="Resistance Levels">
-              <LevelPills levels={result.resistance} color="bg-red-900/40 border-red-700/60 text-red-400" />
-            </Section>
+            <Panel title="Support Levels" icon={<TrendingUp className="w-4 h-4 text-emerald-400" />}>
+              <div className="flex flex-wrap gap-2">
+                {(result.support ?? []).map((l, i) => (
+                  <span key={i} className="font-mono text-xs px-3 py-1.5 rounded-lg border bg-emerald-950/20 border-emerald-800/40 text-emerald-400">
+                    {formatCurrency(l, false, "USD")}
+                  </span>
+                ))}
+                {(result.support ?? []).length === 0 && <span className="text-gray-600 text-sm">No levels identified</span>}
+              </div>
+            </Panel>
+            <Panel title="Resistance Levels" icon={<TrendingDown className="w-4 h-4 text-red-400" />}>
+              <div className="flex flex-wrap gap-2">
+                {(result.resistance ?? []).map((l, i) => (
+                  <span key={i} className="font-mono text-xs px-3 py-1.5 rounded-lg border bg-red-950/20 border-red-800/40 text-red-400">
+                    {formatCurrency(l, false, "USD")}
+                  </span>
+                ))}
+                {(result.resistance ?? []).length === 0 && <span className="text-gray-600 text-sm">No levels identified</span>}
+              </div>
+            </Panel>
           </div>
 
-          {/* Technical + Fundamental */}
+          {/* ── Row 4: Technical + Fundamental ── */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <Section icon={<BarChart2 className="w-4 h-4" />} title="Technical Analysis">
-              <p className="text-sm text-gray-400 leading-relaxed">{result.technical}</p>
-            </Section>
-            <Section icon={<TrendingUp className="w-4 h-4" />} title="Fundamental Analysis">
-              <p className="text-sm text-gray-400 leading-relaxed">{result.fundamental}</p>
-            </Section>
+            <Panel title="Technical Analysis" icon={<BarChart2 className="w-4 h-4" />}>
+              <p className="text-sm text-gray-300 leading-relaxed whitespace-pre-line">{result.technical}</p>
+            </Panel>
+            <Panel title="Fundamental Analysis" icon={<Activity className="w-4 h-4" />}>
+              <p className="text-sm text-gray-300 leading-relaxed whitespace-pre-line">{result.fundamental}</p>
+            </Panel>
           </div>
 
-          {/* News */}
-          <Section icon={<Newspaper className="w-4 h-4" />} title="News & Sentiment">
-            <p className="text-sm text-gray-400 leading-relaxed">{result.news}</p>
-          </Section>
+          {/* ── Row 5: News & Macro ── */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Panel title="News & Market Sentiment" icon={<Newspaper className="w-4 h-4" />}>
+              <div className="flex items-center gap-2 mb-3">
+                <span className="text-xs text-gray-500">Overall Sentiment:</span>
+                <SentimentBadge sentiment={result.newsSentiment} />
+              </div>
+              <p className="text-sm text-gray-300 leading-relaxed whitespace-pre-line">{result.news}</p>
+            </Panel>
+            <Panel title="Macro Context" icon={<Globe className="w-4 h-4" />}>
+              <p className="text-sm text-gray-300 leading-relaxed whitespace-pre-line">
+                {result.macroContext ?? "No macro context available for this analysis."}
+              </p>
+            </Panel>
+          </div>
 
-          {/* Catalysts + Risks */}
+          {/* ── Row 6: Catalysts + Risks ── */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <Section icon={<Zap className="w-4 h-4 text-emerald-400" />} title="Key Catalysts">
-              <TagList items={result.catalysts} color="bg-emerald-500" />
-            </Section>
-            <Section icon={<ShieldAlert className="w-4 h-4 text-red-400" />} title="Key Risks">
-              <TagList items={result.risks} color="bg-red-500" />
-            </Section>
+            <Panel title="Key Catalysts" icon={<CheckCircle2 className="w-4 h-4 text-emerald-400" />} accent="border-emerald-900/40">
+              <Bullet items={result.catalysts ?? []} color="bg-emerald-500" />
+            </Panel>
+            <Panel title="Key Risks" icon={<XCircle className="w-4 h-4 text-red-400" />} accent="border-red-900/40">
+              <Bullet items={result.risks ?? []} color="bg-red-500" />
+            </Panel>
           </div>
-        </div>
-      )}
 
-      {/* Prompt when no analysis yet */}
-      {!result && !analyze.isPending && !analyze.isError && (
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-16 text-center">
-          <Zap className="w-12 h-12 text-gray-700 mx-auto mb-4" />
-          <p className="text-gray-400 font-medium mb-2">No analysis yet</p>
-          <p className="text-gray-600 text-sm">
-            Select a strategy and provider above, then click <strong className="text-gray-500">Analyze Now</strong>.
-          </p>
+          {/* ── Row 7: Outcome tracking ── */}
+          {result._analysis_id && (
+            <div className="flex items-center justify-between gap-4 px-5 py-4 bg-gray-900 border border-gray-800 rounded-xl">
+              <div className="flex items-center gap-3">
+                <Clock className="w-4 h-4 text-gray-500" />
+                <div>
+                  <p className="text-sm text-gray-300 font-medium">Track this prediction's outcome</p>
+                  <p className="text-xs text-gray-600">
+                    Once the analysis timeframe expires, record whether the call was correct to build your win-rate stats.
+                  </p>
+                </div>
+              </div>
+              <Link href="/dashboard/analysis/history"
+                className="flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-700 hover:border-gray-600 bg-gray-800/50 hover:bg-gray-800 text-sm text-gray-300 hover:text-gray-100 transition-colors flex-shrink-0">
+                View History <ChevronRight className="w-4 h-4" />
+              </Link>
+            </div>
+          )}
+
         </div>
       )}
     </div>

@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "@/lib/api/client";
+import { api, apiSlow } from "@/lib/api/client";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export type Provider = "claude" | "openai" | "gemini";
+export type Provider = "claude" | "openai" | "gemini" | "ollama" | "lmstudio";
 export type Horizon = "trading" | "investing";
 export type AssetClass = "EQUITY" | "CRYPTO" | "ETF";
 
@@ -26,6 +26,21 @@ export interface MarketAsset {
 export interface MarketsResponse {
   crypto: MarketAsset[];
   equities: MarketAsset[];
+}
+
+export interface SearchResult {
+  symbol: string;
+  name: string;
+  asset_class: AssetClass;
+  image?: string | null;
+  exchange?: string | null;
+  coingecko_id?: string | null;
+  rank?: number | null;
+}
+
+export interface SearchResponse {
+  crypto: SearchResult[];
+  equities: SearchResult[];
 }
 
 export interface WatchlistItem {
@@ -62,6 +77,13 @@ export interface AnalyzeRequest {
   horizon: Horizon;
   provider: Provider;
   extra_context?: string;
+  as_of_date?: string | null;  // ISO date — analyze data up to this date (for backtesting)
+}
+
+export interface AgentScores {
+  tech?: number;
+  news?: number;
+  fund?: number;
 }
 
 export interface AnalysisResult {
@@ -78,6 +100,8 @@ export interface AnalysisResult {
   technical: string;
   fundamental: string;
   news: string;
+  newsSentiment?: "BULLISH" | "BEARISH" | "MIXED" | "NEUTRAL";
+  macroContext?: string;
   support: number[];
   resistance: number[];
   catalysts: string[];
@@ -86,6 +110,10 @@ export interface AnalysisResult {
   strategyNote: string;
   _provider: Provider;
   _horizon: Horizon;
+  _agent_scores?: AgentScores;
+  _analysis_id?: string;
+  _as_of_date?: string | null;
+  _entry_price?: number | null;
 }
 
 // ─── Hooks ────────────────────────────────────────────────────────────────────
@@ -96,6 +124,15 @@ export function useMarkets() {
     queryFn: () => api.get("/trading/markets").then((r) => r.data),
     staleTime: 60 * 1000,
     refetchInterval: 60 * 1000,
+  });
+}
+
+export function useAssetSearch(q: string) {
+  return useQuery<SearchResponse>({
+    queryKey: ["trading", "search", q],
+    queryFn: () => api.get("/trading/search", { params: { q } }).then((r) => r.data),
+    enabled: q.trim().length >= 1,
+    staleTime: 5 * 60 * 1000,
   });
 }
 
@@ -127,6 +164,38 @@ export function useRemoveFromWatchlist() {
 
 export function useAnalyzeAsset() {
   return useMutation<AnalysisResult, Error, AnalyzeRequest>({
-    mutationFn: (req) => api.post("/trading/analyze", req).then((r) => r.data),
+    // Use slow instance — multi-agent pipeline can take 60-120s
+    mutationFn: (req) => apiSlow.post("/trading/analyze", req).then((r) => r.data),
+  });
+}
+
+export interface OllamaStatus {
+  available: boolean;
+  models: string[];
+  host: string;
+}
+
+export function useOllamaStatus() {
+  return useQuery<OllamaStatus>({
+    queryKey: ["ollama", "status"],
+    queryFn: () => api.get("/trading/ollama/status").then((r) => r.data),
+    staleTime: 30 * 1000,
+    retry: false,
+  });
+}
+
+export interface LMStudioStatus {
+  available: boolean;
+  models: string[];
+  active_model: string | null;
+  host: string;
+}
+
+export function useLMStudioStatus() {
+  return useQuery<LMStudioStatus>({
+    queryKey: ["lmstudio", "status"],
+    queryFn: () => api.get("/trading/lmstudio/status").then((r) => r.data),
+    staleTime: 15 * 1000,
+    retry: false,
   });
 }

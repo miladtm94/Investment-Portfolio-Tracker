@@ -1,9 +1,11 @@
 import { useMutation } from "@tanstack/react-query";
-import { api } from "@/lib/api/client";
+import { apiSlow } from "@/lib/api/client";
+import type { Provider } from "./useTrading";
 
 interface ChatRequest {
   message: string;
   session_id?: string;
+  provider?: Provider;
 }
 
 interface ChatResponse {
@@ -17,7 +19,7 @@ interface ChatResponse {
 export function useAdvisorChat() {
   const mutation = useMutation<ChatResponse, Error, ChatRequest>({
     mutationFn: (req) =>
-      api.post("/advisor/chat", req).then((r) => r.data),
+      apiSlow.post("/advisor/chat", req).then((r) => r.data),
   });
 
   return {
