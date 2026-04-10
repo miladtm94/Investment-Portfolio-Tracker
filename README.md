@@ -58,9 +58,9 @@ A self-hosted platform for tracking equities, ETFs, and crypto across multiple b
 **Prerequisites:** Docker, Docker Compose
 
 ```bash
-git clone https://github.com/your-username/investment-portfolio-tracker
-cd investment-portfolio-tracker
-cp .env.example .env   # add your API keys
+git clone https://github.com/miladtm94/Investment-Portfolio-Tracker
+cd Investment-Portfolio-Tracker
+cp .env.example .env   # fill in your API keys
 docker compose up -d
 ```
 
@@ -71,7 +71,7 @@ Open [http://localhost:3000](http://localhost:3000) — register, then start imp
 GEMINI_API_KEY=your-key      # free tier works
 # or ANTHROPIC_API_KEY / OPENAI_API_KEY
 POSTGRES_DB=investment_platform
-JWT_SECRET_KEY=change-me
+JWT_SECRET_KEY=change-me-min-32-chars
 ENCRYPTION_KEY=32-char-string-here!!
 ```
 
@@ -88,7 +88,7 @@ ENCRYPTION_KEY=32-char-string-here!!
 | CommSec | CSV export | Equities, ETFs |
 | Interactive Brokers | Flex Query CSV | All asset classes |
 | Kraken | Trades CSV export | Crypto |
-| MooMoo, Stake | CSV | Auto-detected |
+| MooMoo, Stake, CMC | CSV | Auto-detected |
 
 Go to **Portfolio** → **Add Portfolio** → select your broker → upload CSV.
 
@@ -97,23 +97,36 @@ Go to **Portfolio** → **Add Portfolio** → select your broker → upload CSV.
 ```
 backend/
   routers/          # FastAPI endpoints (portfolio, trading, advisor, tax…)
-  services/         # Business logic
-    agents/         # Multi-agent AI pipeline (_base, technical, news, fundamental, synthesis)
+  services/
+    agents/         # Multi-agent AI pipeline (technical, news, fundamental, synthesis)
   shared/           # Models, auth, cache
 frontend/
   src/app/dashboard/
-    page.tsx        # Dashboard overview
     transactions/   # Portfolio management & CSV import
-    analysis/       # AI asset analysis
+    analysis/       # AI asset analysis with historical backtesting
     advisor/        # AI portfolio chat
-    markets/        # Live markets
+    markets/        # Live markets & prices
     watchlist/      # Watchlist
     analytics/      # Performance & risk metrics
 ```
 
+## Roadmap
+
+- [ ] Real-time broker sync (Plaid, Snaptrade, Kraken API)
+- [ ] Options and derivatives tracking
+- [ ] FinBERT financial sentiment model (local, no API)
+- [ ] RAG memory — AI learns from past predictions and outcomes
+- [ ] Mobile-responsive PWA
+- [ ] Multi-user / team portfolios
+- [ ] Hosted SaaS version
+
 ## Contributing
 
-PRs welcome. Please open an issue first for significant changes.
+PRs welcome. Open an issue first for significant changes.
+
+## Disclaimer
+
+> This software is for informational and educational purposes only. It does not constitute financial advice. Always consult a licensed financial adviser before making investment decisions. The authors are not responsible for any trading losses.
 
 ## License
 

@@ -35,8 +35,17 @@ env/
 postgres_data/
 redis_data/
 
+# Personal transaction data — never commit real brokerage files
+PortfolioTransactions/
+personal/
+private/
+
 # Local data samples
 samples/
+
+# Frontend lock file (avoids noise for contributors using different package managers)
+frontend/package-lock.json
+frontend/yarn.lock
 
 # Logs
 *.log
