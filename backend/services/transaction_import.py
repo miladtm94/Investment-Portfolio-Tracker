@@ -127,7 +127,7 @@ BROKER_SIGNATURES: list[tuple[set[str], BrokerProfile]] = [
         ),
     ),
 
-    # CMC Invest — has "AsxCode" and "Brokerage" (real export format)
+    # CMC Invest — variant 1: "AsxCode" and "Brokerage"
     (
         {"asxcode", "brokerage"},
         BrokerProfile(
@@ -144,6 +144,66 @@ BROKER_SIGNATURES: list[tuple[set[str], BrokerProfile]] = [
                 "notes": "Account Name",
             },
             date_format="%Y-%m-%d",
+        ),
+    ),
+
+    # CMC Invest — variant 2: "Contract Note Number" (older export)
+    (
+        {"contract note number", "consideration"},
+        BrokerProfile(
+            name="CMC Invest",
+            default_currency="AUD",
+            column_map={
+                "date": "Trade Date",
+                "type": "Buy/Sell",
+                "symbol": "ASX Code",
+                "quantity": "Quantity",
+                "price": "Price",
+                "fees": "Brokerage",
+                "net_amount": "Consideration",
+                "notes": "Contract Note Number",
+            },
+            date_format="%d/%m/%Y",
+        ),
+    ),
+
+    # CMC Invest — variant 3: "Code" and "Consideration" (another export style)
+    (
+        {"code", "consideration", "order type"},
+        BrokerProfile(
+            name="CMC Invest",
+            default_currency="AUD",
+            column_map={
+                "date": "Trade Date",
+                "type": "Order Type",
+                "symbol": "Code",
+                "quantity": "Quantity",
+                "price": "Price",
+                "fees": "Brokerage",
+                "net_amount": "Consideration",
+                "notes": "Account Name",
+            },
+            date_format="%Y-%m-%d",
+        ),
+    ),
+
+    # MooMoo — variant 2: "Stock Code" column (trade history export)
+    (
+        {"stock code", "filled qty", "filled price"},
+        BrokerProfile(
+            name="Moomoo",
+            default_currency="USD",
+            column_map={
+                "date": "Filled Time",
+                "type": "Side",
+                "symbol": "Stock Code",
+                "quantity": "Filled Qty",
+                "price": "Filled Price",
+                "fees": "Fee",
+                "currency": "Currency",
+                "notes": "Order Type",
+            },
+            date_format=None,
         ),
     ),
 
@@ -334,9 +394,24 @@ class TransactionImporter:
 
     # ─── File Parsers ────────────────────────────────────────────────────
 
+    # Keywords that strongly indicate a header row
+    _HEADER_KEYWORDS = {
+        "date", "time", "type", "symbol", "ticker", "quantity", "qty", "price",
+        "side", "action", "buy", "sell", "code", "asset", "coin", "pair",
+        "security", "brokerage", "commission", "fee", "fees", "currency",
+        "consideration", "proceeds", "net", "total", "amount", "units", "shares",
+        "asxcode", "tradeprice", "ibcommission", "txid",
+        # CommSec specific
+        "reference", "security code", "security description", "net proceeds",
+        # CMC specific
+        "order type", "account name",
+        # Moomoo specific
+        "instrument code", "market code", "filled qty",
+    }
+
     def _parse_csv(self, content: bytes) -> list[dict]:
         """Parse CSV with encoding detection, metadata skipping, dialect sniffing."""
-        for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        for encoding in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
             try:
                 text = content.decode(encoding)
                 break
@@ -345,25 +420,31 @@ class TransactionImporter:
         else:
             text = content.decode("latin-1", errors="replace")
 
-        lines = text.splitlines()
+        # Normalise line endings
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
 
-        # Skip metadata/preamble: find first line with 3+ comma-separated tokens
-        # where the first token is not purely numeric
-        header_idx = 0
-        for i, line in enumerate(lines):
+        # Find the header row: the line whose lowercased tokens most overlap with
+        # known header keywords.  We score each candidate and pick the best one.
+        best_idx = 0
+        best_score = -1
+        for i, line in enumerate(lines[:30]):   # only look in the first 30 lines
             stripped = line.strip()
             if not stripped:
                 continue
             for delim in (",", "\t", ";"):
-                parts = [p.strip().strip('"') for p in stripped.split(delim)]
-                if len(parts) >= 3 and not parts[0].lstrip("-").replace(".", "").isdigit():
-                    header_idx = i
-                    break
-            else:
-                continue
-            break
+                parts = [p.strip().strip('"').lower() for p in stripped.split(delim)]
+                if len(parts) < 2:
+                    continue
+                score = sum(1 for p in parts if p in self._HEADER_KEYWORDS)
+                # Also award partial matches (e.g. "trade date" contains "date")
+                score += sum(0.5 for p in parts
+                             if any(kw in p for kw in ("date", "code", "type", "price", "qty", "amount")))
+                if score > best_score:
+                    best_score = score
+                    best_idx = i
+                break   # use first delimiter that gives multiple tokens
 
-        clean_text = "\n".join(lines[header_idx:])
+        clean_text = "\n".join(lines[best_idx:])
 
         try:
             dialect = csv.Sniffer().sniff(clean_text[:8192], delimiters=",;\t")
@@ -371,7 +452,14 @@ class TransactionImporter:
             dialect = csv.excel
 
         reader = csv.DictReader(io.StringIO(clean_text), dialect=dialect)
-        return [dict(row) for row in reader if any(v and str(v).strip() for v in row.values())]
+        rows = [dict(row) for row in reader if any(v and str(v).strip() for v in row.values())]
+
+        if not rows:
+            # Last resort: try without skipping any header
+            reader2 = csv.DictReader(io.StringIO("\n".join(lines)), dialect=dialect)
+            rows = [dict(row) for row in reader2 if any(v and str(v).strip() for v in row.values())]
+
+        return rows
 
     def _parse_excel(self, content: bytes) -> list[dict]:
         df = pd.read_excel(io.BytesIO(content), engine="openpyxl")

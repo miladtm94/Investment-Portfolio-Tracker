@@ -9,11 +9,18 @@ function createInstance(timeout: number): AxiosInstance {
     timeout,
   });
 
-  // Inject JWT on every request
+  // Inject JWT on every request + fix FormData Content-Type
   instance.interceptors.request.use((config) => {
     if (typeof window !== "undefined") {
       const token = localStorage.getItem("access_token");
       if (token) config.headers.Authorization = `Bearer ${token}`;
+    }
+    // When sending FormData, delete the default Content-Type so the browser can
+    // set it automatically with the correct multipart/form-data boundary.
+    // Without this, the axios instance default "application/json" overrides it,
+    // causing FastAPI to return 422 (can't parse file/form fields).
+    if (config.data instanceof FormData) {
+      delete config.headers["Content-Type"];
     }
     return config;
   });

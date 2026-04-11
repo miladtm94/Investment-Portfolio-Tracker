@@ -1,7 +1,10 @@
 """Transactions router — CRUD, import, history."""
+import logging
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from pydantic import BaseModel
@@ -232,16 +235,38 @@ async def import_transactions(
         raise HTTPException(status_code=404, detail="Account not found")
 
     content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    filename = file.filename or "upload.csv"
+    ext = filename.lower().split(".")[-1]
+    if ext not in ("csv", "txt", "xlsx", "xls", "json"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '.{ext}'. Please upload a CSV, Excel, or JSON file."
+        )
+
     importer = TransactionImporter(db)
-    result = await importer.import_file(
-        file_content=content,
-        file_name=file.filename or "upload.csv",
-        account_id=account_id,
-        user_id=current_user.id,
-    )
+    try:
+        result = await importer.import_file(
+            file_content=content,
+            file_name=filename,
+            account_id=account_id,
+            user_id=current_user.id,
+        )
+    except Exception as exc:
+        logger.error("Import failed for account %s: %s", account_id, exc)
+        raise HTTPException(status_code=500, detail=f"Import error: {exc}")
 
     if result.imported > 0:
         await cache_invalidate_user(current_user.id)
+
+    # If nothing was imported and there are errors, surface them clearly
+    if result.imported == 0 and result.duplicates == 0 and result.errors > 0:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No transactions imported. Errors: {'; '.join(result.error_details[:5])}"
+        )
 
     return ImportResultResponse(
         total_rows=result.total_rows,

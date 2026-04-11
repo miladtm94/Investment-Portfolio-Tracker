@@ -461,12 +461,57 @@ async def analyze_asset(
         except Exception:
             return None
 
+    async def _fetch_user_position() -> str:
+        """Fetch the user's current position in this symbol from their portfolio."""
+        try:
+            from services.portfolio_engine import PortfolioEngine
+            from services.market_data_service import MarketDataService as MDS
+            mds = MDS()
+            engine = PortfolioEngine(db, mds)
+            summary = await engine.get_portfolio_summary(
+                user_id=current_user.id,
+                account_ids=None,
+                cost_basis_method=getattr(current_user, "cost_basis_method", "FIFO"),
+            )
+            await mds.close()
+            # Find matching holding — strip .AX suffix for ASX stocks
+            sym_clean = sym.replace(".AX", "")
+            holding = next(
+                (h for h in summary.holdings if h.symbol.upper().replace(".AX", "") == sym_clean),
+                None
+            )
+            if not holding:
+                return ""
+            qty   = float(holding.quantity)
+            avg   = float(holding.average_cost_basis or 0)
+            mv    = float(holding.market_value or 0)
+            pnl   = float(holding.unrealized_gain or 0)
+            pnl_p = float(holding.unrealized_gain_pct or 0)
+            weight = (mv / float(summary.total_market_value) * 100) if summary.total_market_value else 0
+            lines = [
+                f"=== User's Current Position in {sym} ===",
+                f"Shares held: {qty:,.4f}",
+                f"Average cost basis: ${avg:,.4f}",
+                f"Current market value: ${mv:,.2f}",
+                f"Unrealised P&L: ${pnl:+,.2f} ({pnl_p:+.2f}%)",
+                f"Portfolio weight: {weight:.1f}%",
+            ]
+            if pnl_p < -10:
+                lines.append("NOTE: This is a losing position — factor this into risk assessment and consider stop-loss proximity.")
+            elif pnl_p > 50:
+                lines.append("NOTE: This position has significant unrealised gains — factor in potential profit-taking and CGT implications.")
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.debug("Could not fetch user position for %s: %s", sym, exc)
+            return ""
+
     # Fetch price + all AI context in parallel
-    price_res, tech_ctx, news_ctx, macro_ctx = await asyncio.gather(
+    price_res, tech_ctx, news_ctx, macro_ctx, position_ctx = await asyncio.gather(
         _fetch_price(),
         _fetch_technical_context(sym, as_of=as_of_dt),
         news_service.fetch_asset_news(sym, req.asset_class),
         macro_service.fetch_macro_context(req.asset_class),
+        _fetch_user_position(),
         return_exceptions=True,
     )
 
@@ -481,11 +526,15 @@ async def analyze_asset(
     if isinstance(macro_ctx, Exception):
         logger.warning("Macro context failed: %s", macro_ctx)
         macro_ctx = ""
+    if isinstance(position_ctx, Exception):
+        position_ctx = ""
 
     # Build extra context string
     extra_parts: list[str] = []
     if as_of_dt:
         extra_parts.append(f"ANALYSIS DATE: {as_of_dt.strftime('%Y-%m-%d')} (historical — use data up to this date only)")
+    if position_ctx:
+        extra_parts.append(position_ctx)
     if req.sector:
         extra_parts.append(f"Sector: {req.sector}")
     if req.exchange:
