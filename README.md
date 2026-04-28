@@ -26,7 +26,7 @@ InvestIQ helps you track investments across brokers and exchanges, convert mixed
 
 ## Screenshots
 
-A quick look at the dashboard, transaction imports, analytics, markets, and AI portfolio advisor.
+A quick visual tour of InvestIQ and the main workflows it brings together.
 
 <p align="center">
   <img src="docs/screenshots/dashboard.png" alt="InvestIQ dashboard" width="900">
