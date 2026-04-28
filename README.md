@@ -2,7 +2,7 @@
 
 # InvestIQ
 
-**Open-source investment portfolio tracker with AI-powered insights**
+**Self-hosted portfolio tracking for equities, ETFs, and crypto.**
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
@@ -12,130 +12,111 @@
 
 </div>
 
----
-
-A self-hosted platform for tracking equities, ETFs, and crypto across multiple brokers — with multi-agent AI analysis, an interactive portfolio advisor, and ATO-compliant tax reporting. Built for Australian investors; works globally.
+InvestIQ helps you track investments across brokers and exchanges, convert mixed AUD/USD holdings correctly, review performance, estimate tax outcomes, and ask AI-assisted questions about your portfolio. It is built with Australian investors in mind, but works for global portfolios too.
 
 ## Features
 
-![Demo Screenshot](./demo-screenshot.png)
+- Import transactions from CommSec, Interactive Brokers, Kraken, Stake, CMC, MooMoo, and similar broker CSV exports.
+- Track equities, ETFs, and crypto across multiple accounts.
+- Toggle AUD/USD reporting with per-transaction FX handling.
+- Review holdings, cost basis, unrealized P&L, dividends, staking income, and realized gains.
+- Analyze performance, allocation, risk, drawdowns, and benchmark comparison.
+- Use AI analysis and a portfolio advisor with Gemini, Claude, OpenAI, Ollama, or LM Studio.
+- Run locally with Docker Compose, PostgreSQL, Redis, FastAPI, and Next.js.
 
-**Portfolio**
-- Import CSV exports from CommSec, IBKR, Kraken, and more — auto-detected and parsed
-- Multi-account view grouped by broker, with active/demo account toggle
-- AUD base currency with automatic FX conversion (RBA rates)
-- Cost basis tracking (FIFO/LIFO/HIFO), unrealised P&L, dividend income
+## Screenshots
 
-**AI Analysis**
-- Multi-agent pipeline: Technical · News · Fundamental agents run in parallel, synthesised by a best-model provider
-- Choose your AI provider: **Gemini · Claude · OpenAI · Ollama · LM Studio**
-- Historical backtesting — set an analysis date and verify predictions against actual outcomes
-- Professional output: price map, support/resistance, catalysts, risks, agent sub-scores
+Screenshots make this project much easier to understand at a glance. Recommended setup:
 
-**AI Portfolio Advisor**
-- Chat interface that knows your actual holdings
-- Answers questions about risk, P&L, sector exposure, tax-loss harvesting
-- Works with any configured provider (no Anthropic credits required)
+- Store images in `docs/screenshots/`.
+- Use optimized `.webp` files under about 500 KB each.
+- Capture with demo data only; never use real account balances, names, API keys, or transactions.
+- Include 3-5 images: dashboard, holdings/import flow, analytics, AI advisor, and tax view.
+- Use consistent browser width, theme, and zoom. Good defaults are `1440x900` for desktop and `390x844` for mobile.
+- Name files clearly, for example `dashboard.webp`, `transactions-import.webp`, `analytics.webp`, `advisor.webp`.
 
-**Markets & Watchlist**
-- Live prices for top crypto and equities (CoinGecko + Yahoo Finance)
-- Watchlist with real-time price tracking
-- TradingView live candlestick charts on every asset
+After adding screenshots, place the main one near the top:
 
-**Tax**
-- ATO CGT rules — 50% discount, FIFO lot tracking, Australian financial year (Jul–Jun)
-- Tax summary with realised gains/losses and estimated liability
-
-## Stack
-
-| Layer | Technology |
-|---|---|
-| Backend | Python 3.12, FastAPI, SQLAlchemy (async), PostgreSQL 16, Redis |
-| Frontend | Next.js 15, TypeScript, Tailwind CSS, TanStack Query |
-| AI | Anthropic Claude, OpenAI, Google Gemini, Ollama, LM Studio |
-| Infrastructure | Docker Compose |
+```md
+![InvestIQ dashboard](docs/screenshots/dashboard.webp)
+```
 
 ## Quick Start
 
-**Prerequisites:** Docker, Docker Compose
+Prerequisites: Docker and Docker Compose.
 
 ```bash
 git clone https://github.com/miladtm94/Investment-Portfolio-Tracker
 cd Investment-Portfolio-Tracker
-cp .env.example .env   # fill in your API keys
+cp .env.example .env
 docker compose up -d
 ```
 
-Open [http://localhost:3000](http://localhost:3000) — register, then start importing.
-The backend is published on [http://localhost:8010](http://localhost:8010) by default to avoid common local port conflicts.
+Open the app at [http://localhost:3000](http://localhost:3000).
 
-For day-to-day Docker use:
+The backend runs on [http://localhost:8010](http://localhost:8010) by default to avoid common local port conflicts.
+
+Useful commands:
 
 ```bash
 make serve         # start existing containers
 make rebuild       # rebuild with Docker cache
-make clean-rebuild # full no-cache rebuild, only when needed
+make clean-rebuild # full no-cache rebuild
+make logs          # follow container logs
+make stop          # stop services
 ```
 
-**Minimum viable `.env`** (only one AI key needed):
+Minimum `.env` values:
+
 ```env
-GEMINI_API_KEY=your-key      # free tier works
-# or ANTHROPIC_API_KEY / OPENAI_API_KEY
 POSTGRES_DB=investment_platform
 JWT_SECRET_KEY=change-me-min-32-chars
 ENCRYPTION_KEY=32-char-string-here!!
+
+# Optional: add at least one AI provider key
+GEMINI_API_KEY=your-key
+# or ANTHROPIC_API_KEY / OPENAI_API_KEY
 ```
 
-## Local AI (no API key needed)
+## Broker Imports
 
-**LM Studio:** Download [LM Studio](https://lmstudio.ai), load any model, enable **Local Server** tab. The app auto-detects it and shows a green dot in the provider selector.
-
-**Ollama:** `ollama serve` then `ollama pull gemma3:4b`. Same auto-detection applies.
-
-## Importing Brokers
-
-| Broker | Format | Notes |
+| Source | Method | Notes |
 |---|---|---|
-| CommSec | CSV export | Equities, ETFs |
-| Interactive Brokers | Flex Query CSV | All asset classes |
-| Kraken | Trades CSV export | Crypto |
-| MooMoo, Stake, CMC | CSV | Auto-detected |
+| CommSec | CSV export | ASX equities and ETFs |
+| Interactive Brokers | Flex Query / CSV | Global assets, dividends, cash transactions |
+| Kraken | Trades CSV / API sync | Crypto, mainly USD quoted |
+| Stake, CMC, MooMoo | CSV export | Auto-detected where supported |
 
-Go to **Portfolio** → **Add Portfolio** → select your broker → upload CSV.
+Go to **Dashboard -> Transactions**, choose your broker, then upload the export file.
 
-## Project Structure
+## Local AI
 
-```
-backend/
-  routers/          # FastAPI endpoints (portfolio, trading, advisor, tax…)
-  services/
-    agents/         # Multi-agent AI pipeline (technical, news, fundamental, synthesis)
-  shared/           # Models, auth, cache
-frontend/
-  src/app/dashboard/
-    transactions/   # Portfolio management & CSV import
-    analysis/       # AI asset analysis with historical backtesting
-    advisor/        # AI portfolio chat
-    markets/        # Live markets & prices
-    watchlist/      # Watchlist
-    analytics/      # Performance & risk metrics
-```
+You can use local models without a hosted API key.
 
-## Roadmap
+- **LM Studio:** start the Local Server in LM Studio. InvestIQ can connect to it automatically.
+- **Ollama:** run `ollama serve`, then pull a model such as `ollama pull gemma3:4b`.
 
-- [ ] Real-time broker sync (Plaid, Snaptrade, Kraken API)
-- [ ] Options and derivatives tracking
-- [ ] FinBERT financial sentiment model (local, no API)
-- [ ] RAG memory — AI learns from past predictions and outcomes
-- [ ] Mobile-responsive PWA
-- [ ] Multi-user / team portfolios
-- [ ] Hosted SaaS version
+## Tech Stack
 
+| Layer | Technology |
+|---|---|
+| Frontend | Next.js 15, TypeScript, Tailwind CSS, TanStack Query |
+| Backend | Python 3.12, FastAPI, SQLAlchemy async |
+| Data | PostgreSQL, Redis |
+| Market Data | Yahoo Finance, CoinGecko, provider fallbacks |
+| AI | Gemini, Claude, OpenAI, Ollama, LM Studio |
+| DevOps | Docker Compose |
+
+## Support
+
+If this project saves you time, fuels your research, or helps you wrangle your portfolio, you can support it here:
+
+[☕💛 Buy me a coffee](https://www.buymeacoffee.com/miladtm94)
 
 ## Disclaimer
 
-> This software is for informational and educational purposes only. It does not constitute financial advice. Always consult a licensed financial adviser before making investment decisions. The authors are not responsible for any trading losses.
+This software is for informational and educational purposes only. It is not financial, tax, or investment advice. Always verify calculations independently and consult a licensed professional before making financial decisions.
 
 ## License
 
-MIT
+Released under the [MIT License](LICENSE).
