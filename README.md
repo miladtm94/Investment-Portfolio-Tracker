@@ -36,9 +36,13 @@ A quick visual tour of InvestIQ and the main workflows it brings together.
 |---|---|
 | <img src="docs/screenshots/transactions.png" alt="Transaction import and holdings view" width="440"> | <img src="docs/screenshots/analytics.png" alt="Portfolio analytics view" width="440"> |
 
-| Markets | AI Advisor |
+| Markets | Asset Analysis |
 |---|---|
-| <img src="docs/screenshots/markets.png" alt="Markets and watchlist view" width="440"> | <img src="docs/screenshots/advisor.png" alt="AI portfolio advisor view" width="440"> |
+| <img src="docs/screenshots/markets.png" alt="Markets and watchlist view" width="440"> | <img src="docs/screenshots/asset-analysis.png" alt="AI asset analysis view" width="440"> |
+
+| AI Portfolio Advisor |
+|---|
+| <img src="docs/screenshots/advisor.png" alt="AI portfolio advisor view" width="900"> |
 
 ## Quick Start
 
