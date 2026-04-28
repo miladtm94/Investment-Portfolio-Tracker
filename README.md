@@ -26,20 +26,19 @@ InvestIQ helps you track investments across brokers and exchanges, convert mixed
 
 ## Screenshots
 
-Screenshots make this project much easier to understand at a glance. Recommended setup:
+A quick look at the dashboard, transaction imports, analytics, markets, and AI portfolio advisor.
 
-- Store images in `docs/screenshots/`.
-- Use optimized `.webp` files under about 500 KB each.
-- Capture with demo data only; never use real account balances, names, API keys, or transactions.
-- Include 3-5 images: dashboard, holdings/import flow, analytics, AI advisor, and tax view.
-- Use consistent browser width, theme, and zoom. Good defaults are `1440x900` for desktop and `390x844` for mobile.
-- Name files clearly, for example `dashboard.webp`, `transactions-import.webp`, `analytics.webp`, `advisor.webp`.
+<p align="center">
+  <img src="docs/screenshots/dashboard.png" alt="InvestIQ dashboard" width="900">
+</p>
 
-After adding screenshots, place the main one near the top:
+| Transactions | Analytics |
+|---|---|
+| <img src="docs/screenshots/transactions.png" alt="Transaction import and holdings view" width="440"> | <img src="docs/screenshots/analytics.png" alt="Portfolio analytics view" width="440"> |
 
-```md
-![InvestIQ dashboard](docs/screenshots/dashboard.webp)
-```
+| Markets | AI Advisor |
+|---|---|
+| <img src="docs/screenshots/markets.png" alt="Markets and watchlist view" width="440"> | <img src="docs/screenshots/advisor.png" alt="AI portfolio advisor view" width="440"> |
 
 ## Quick Start
 
