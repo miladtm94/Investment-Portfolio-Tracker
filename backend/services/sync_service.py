@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import asyncio
 import logging
 import time
 import urllib.parse
+import xml.etree.ElementTree as ET
 from base64 import b64decode, b64encode
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -71,6 +73,8 @@ class SyncService:
                 result = await BinanceConnector(self.db, self.http).sync(account, credential, user_id)
             elif provider == "PLAID":
                 result = await PlaidConnector(self.db, self.http).sync(account, credential, user_id)
+            elif provider in {"IBKR", "INTERACTIVE_BROKERS"}:
+                result = await IBKRFlexConnector(self.db, self.http).sync(account, credential, user_id)
             else:
                 result = {"error": f"Unsupported provider: {provider}"}
 
@@ -634,6 +638,408 @@ class BinanceConnector:
             self.db.add(asset)
             await self.db.flush()
         return asset.id
+
+    @staticmethod
+    def _decrypt(encrypted: Optional[bytes]) -> str:
+        if not encrypted:
+            return ""
+        return encrypted.decode("utf-8", errors="replace")
+
+
+class IBKRFlexConnector:
+    """Interactive Brokers Flex Web Service connector."""
+    BASE_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService"
+
+    def __init__(self, db: AsyncSession, http: httpx.AsyncClient):
+        self.db = db
+        self.http = http
+
+    async def sync(self, account: Account, credential: ApiCredential, user_id: str) -> dict:
+        flex_token = self._decrypt(credential.encrypted_access_token)
+        query_id = self._decrypt(credential.encrypted_api_key)
+
+        if not flex_token or not query_id:
+            return {"imported": 0, "provider": "ibkr", "error": "Missing IBKR Flex token or query ID"}
+
+        xml_text = await self._fetch_statement(flex_token, query_id)
+        root = ET.fromstring(xml_text)
+
+        imported = 0
+        trade_count = 0
+        cash_count = 0
+
+        trades = self._elements(root, "Trade")
+        cash_transactions = self._elements(root, "CashTransaction")
+        dividend_accruals = self._elements(root, "ChangeInDividendAccrual")
+
+        for trade in trades:
+            trade_count += 1
+            txn = await self._normalize_trade(trade.attrib, account.id, user_id)
+            if txn:
+                imported += 1
+
+        for cash_txn in cash_transactions:
+            cash_count += 1
+            txn = await self._normalize_cash_transaction(cash_txn.attrib, account.id, user_id)
+            if txn:
+                imported += 1
+
+        dividend_count = 0
+        for dividend in dividend_accruals:
+            dividend_count += 1
+            txn = await self._normalize_dividend_accrual(dividend.attrib, account.id, user_id)
+            if txn:
+                imported += 1
+
+        await self.db.commit()
+        result: dict = {
+            "imported": imported,
+            "provider": "ibkr",
+            "trades_found": trade_count,
+            "cash_transactions_found": cash_count,
+            "dividend_accruals_found": dividend_count,
+        }
+        if trade_count == 0 and cash_count == 0 and dividend_count == 0:
+            result["error"] = (
+                "IBKR returned a Flex report, but it did not contain Trades, Cash Transactions, "
+                "or Change in Dividend Accruals rows. Edit the Activity Flex Query to include those sections, "
+                "set delivery format to XML, save it, then sync again."
+            )
+        return result
+
+    async def _fetch_statement(self, flex_token: str, query_id: str) -> str:
+        """Generate and retrieve an IBKR Flex statement XML document."""
+        request_id = await self._send_request(flex_token, query_id)
+
+        # IBKR often needs a short processing window before the statement is ready.
+        for delay in (2, 3, 5, 8, 13):
+            await asyncio.sleep(delay)
+            statement = await self._get_statement(flex_token, request_id)
+            if statement:
+                return statement
+
+        raise Exception("IBKR Flex statement was not ready. Try again in a minute.")
+
+    async def _send_request(self, flex_token: str, query_id: str) -> str:
+        params = {"t": flex_token, "q": query_id, "v": "3"}
+        resp = await self.http.get(f"{self.BASE_URL}/SendRequest", params=params, headers=self._headers())
+        resp.raise_for_status()
+        root = ET.fromstring(resp.text)
+
+        status = self._find_text(root, "Status")
+        if status and status.lower() != "success":
+            code = self._find_text(root, "ErrorCode")
+            message = self._find_text(root, "ErrorMessage") or "IBKR Flex request failed"
+            raise Exception(f"IBKR Flex error {code or ''}: {message}".strip())
+
+        reference_code = self._find_text(root, "ReferenceCode")
+        if not reference_code:
+            raise Exception("IBKR Flex did not return a reference code")
+        return reference_code
+
+    async def _get_statement(self, flex_token: str, reference_code: str) -> Optional[str]:
+        params = {"t": flex_token, "q": reference_code, "v": "3"}
+        resp = await self.http.get(f"{self.BASE_URL}/GetStatement", params=params, headers=self._headers(), follow_redirects=True)
+        resp.raise_for_status()
+
+        root = ET.fromstring(resp.text)
+        status = self._find_text(root, "Status")
+        if status and status.lower() != "success":
+            message = self._find_text(root, "ErrorMessage") or ""
+            code = self._find_text(root, "ErrorCode") or ""
+            if "not ready" in message.lower() or code in {"1019", "1021"}:
+                return None
+            raise Exception(f"IBKR Flex error {code}: {message}".strip())
+
+        if (
+            self._elements(root, "Trade")
+            or self._elements(root, "CashTransaction")
+            or self._elements(root, "ChangeInDividendAccrual")
+            or self._local_name(root.tag) == "FlexQueryResponse"
+        ):
+            return resp.text
+        return None
+
+    async def _normalize_trade(self, trade: dict, account_id: str, user_id: str) -> Optional[Transaction]:
+        try:
+            symbol = self._clean_symbol(self._value(trade, "symbol", "Symbol", "underlyingSymbol", "UnderlyingSymbol"))
+            if not symbol:
+                return None
+
+            quantity = abs(self._decimal(self._value(trade, "quantity", "Quantity")))
+            if quantity == ZERO:
+                return None
+
+            buy_sell = self._value(trade, "buySell", "Buy/Sell", "side", "Side").upper()
+            signed_qty = self._decimal(self._value(trade, "quantity", "Quantity"))
+            txn_type = "SELL" if buy_sell.startswith("S") or signed_qty < ZERO else "BUY"
+
+            price = self._decimal(self._value(trade, "tradePrice", "TradePrice", "price", "Price"))
+            fees = abs(self._decimal(self._value(trade, "ibCommission", "IBCommission", "commission", "Commission")))
+            net_cash = self._maybe_decimal(self._value(trade, "netCash", "NetCash"))
+            currency = self._value(trade, "currency", "Currency", "currencyPrimary", "CurrencyPrimary", "ibCommissionCurrency", "IBCommissionCurrency") or "USD"
+            txn_date = self._parse_ibkr_date(self._value(trade, "dateTime", "DateTime", "tradeDate", "TradeDate", "reportDate", "ReportDate"))
+            transaction_id = self._value(trade, "transactionID", "TransactionID", "tradeID", "TradeID", "ibExecID", "IBExecID")
+
+            import_hash = hashlib.sha256(
+                f"ibkr|trade|{transaction_id}|{symbol}|{txn_type}|{txn_date.isoformat()}|{quantity}|{price}|{net_cash}".encode()
+            ).hexdigest()
+            existing = await self.db.execute(select(Transaction).where(Transaction.import_hash == import_hash))
+            if existing.scalar_one_or_none():
+                return None
+
+            asset_id = await self._resolve_asset(symbol, currency, trade)
+            if net_cash is None:
+                gross = quantity * price
+                net_cash = gross - fees if txn_type == "SELL" else -(gross + fees)
+
+            txn = Transaction(
+                account_id=account_id,
+                user_id=user_id,
+                asset_id=asset_id,
+                transaction_type=txn_type,
+                quantity=quantity,
+                price_per_unit=price,
+                fees=fees,
+                net_amount=net_cash,
+                currency=currency,
+                transacted_at=txn_date,
+                external_id=transaction_id or None,
+                import_hash=import_hash,
+                source="IBKR_API",
+                raw_data=trade,
+                notes=self._value(trade, "description", "Description"),
+            )
+            self.db.add(txn)
+            return txn
+        except Exception as e:
+            logger.warning(f"IBKR trade normalize error: {e}")
+            return None
+
+    async def _normalize_cash_transaction(self, cash_txn: dict, account_id: str, user_id: str) -> Optional[Transaction]:
+        try:
+            raw_type = self._value(cash_txn, "type", "Type", "transactionType", "TransactionType", "activityCode", "ActivityCode").lower()
+            description = self._value(cash_txn, "description", "Description")
+            symbol = self._clean_symbol(self._value(cash_txn, "symbol", "Symbol", "underlyingSymbol", "UnderlyingSymbol"))
+            amount = self._decimal(self._value(cash_txn, "amount", "Amount", "netAmount", "NetAmount"))
+            if amount == ZERO:
+                return None
+
+            txn_type = self._map_cash_type(raw_type, description)
+            if not txn_type:
+                return None
+
+            currency = self._value(cash_txn, "currency", "Currency", "currencyPrimary", "CurrencyPrimary") or "USD"
+            txn_date = self._parse_ibkr_date(self._value(cash_txn, "dateTime", "DateTime", "date", "Date", "reportDate", "ReportDate"))
+            transaction_id = self._value(cash_txn, "transactionID", "TransactionID", "transactionId", "TransactionId")
+
+            import_hash = hashlib.sha256(
+                f"ibkr|cash|{transaction_id}|{txn_type}|{symbol}|{txn_date.isoformat()}|{amount}|{description}".encode()
+            ).hexdigest()
+            existing = await self.db.execute(select(Transaction).where(Transaction.import_hash == import_hash))
+            if existing.scalar_one_or_none():
+                return None
+
+            asset_id = await self._resolve_asset(symbol, currency, cash_txn) if symbol else None
+            quantity = self._maybe_decimal(self._value(cash_txn, "quantity", "Quantity"))
+            dividend_per_share = None
+            if txn_type in {"DIVIDEND", "DISTRIBUTION"} and quantity and quantity != ZERO:
+                dividend_per_share = abs(amount / quantity)
+
+            txn = Transaction(
+                account_id=account_id,
+                user_id=user_id,
+                asset_id=asset_id,
+                transaction_type=txn_type,
+                quantity=abs(quantity) if quantity is not None else None,
+                price_per_unit=None,
+                gross_amount=abs(amount),
+                fees=abs(amount) if txn_type == "FEE" else ZERO,
+                net_amount=amount,
+                currency=currency,
+                transacted_at=txn_date,
+                tax_withheld=abs(amount) if txn_type == "FEE" and "tax" in description.lower() else None,
+                dividend_per_share=dividend_per_share,
+                external_id=transaction_id or None,
+                import_hash=import_hash,
+                source="IBKR_API",
+                raw_data=cash_txn,
+                notes=description,
+            )
+            self.db.add(txn)
+            return txn
+        except Exception as e:
+            logger.warning(f"IBKR cash transaction normalize error: {e}")
+            return None
+
+    async def _normalize_dividend_accrual(self, dividend: dict, account_id: str, user_id: str) -> Optional[Transaction]:
+        try:
+            code = self._value(dividend, "code", "Code").upper()
+            if code and code not in {"PO", "RE"}:
+                return None
+
+            symbol = self._clean_symbol(self._value(dividend, "symbol", "Symbol", "underlyingSymbol", "UnderlyingSymbol"))
+            if not symbol:
+                return None
+
+            amount = (
+                self._maybe_decimal(self._value(dividend, "netAmount", "NetAmount"))
+                or self._maybe_decimal(self._value(dividend, "grossAmount", "GrossAmount"))
+                or ZERO
+            )
+            if amount == ZERO:
+                return None
+
+            currency = self._value(dividend, "currency", "Currency", "currencyPrimary", "CurrencyPrimary") or "USD"
+            txn_date = self._parse_ibkr_date(
+                self._value(dividend, "payDate", "PayDate", "exDate", "ExDate", "date", "Date", "reportDate", "ReportDate")
+            )
+            quantity = self._maybe_decimal(self._value(dividend, "quantity", "Quantity"))
+            tax = abs(self._decimal(self._value(dividend, "tax", "Tax")))
+            transaction_id = self._value(dividend, "transactionID", "TransactionID", "transactionId", "TransactionId")
+            gross_rate = self._maybe_decimal(self._value(dividend, "grossRate", "GrossRate"))
+
+            import_hash = hashlib.sha256(
+                f"ibkr|dividend_accrual|{transaction_id}|{symbol}|{txn_date.isoformat()}|{amount}|{code}".encode()
+            ).hexdigest()
+            existing = await self.db.execute(select(Transaction).where(Transaction.import_hash == import_hash))
+            if existing.scalar_one_or_none():
+                return None
+
+            asset_id = await self._resolve_asset(symbol, currency, dividend)
+            txn = Transaction(
+                account_id=account_id,
+                user_id=user_id,
+                asset_id=asset_id,
+                transaction_type="DIVIDEND",
+                quantity=abs(quantity) if quantity is not None else None,
+                gross_amount=abs(amount) + tax,
+                fees=ZERO,
+                net_amount=amount,
+                currency=currency,
+                transacted_at=txn_date,
+                tax_withheld=tax or None,
+                dividend_per_share=gross_rate,
+                external_id=transaction_id or None,
+                import_hash=import_hash,
+                source="IBKR_API",
+                raw_data=dividend,
+                notes=f"Dividend accrual {code}".strip(),
+            )
+            self.db.add(txn)
+            return txn
+        except Exception as e:
+            logger.warning(f"IBKR dividend accrual normalize error: {e}")
+            return None
+
+    async def _resolve_asset(self, symbol: str, currency: str, data: dict) -> Optional[str]:
+        result = await self.db.execute(select(Asset).where(Asset.symbol == symbol))
+        asset = result.scalar_one_or_none()
+        if not asset:
+            asset_category = self._value(data, "assetCategory", "AssetCategory", "AssetClass").upper()
+            asset_class = "ETF" if asset_category == "ETF" else "EQUITY"
+            asset = Asset(
+                symbol=symbol,
+                name=self._value(data, "description", "Description") or symbol,
+                asset_class=asset_class,
+                currency=currency,
+                isin=self._value(data, "isin", "ISIN") or None,
+            )
+            self.db.add(asset)
+            await self.db.flush()
+        return asset.id
+
+    @staticmethod
+    def _find_text(root: ET.Element, tag: str) -> Optional[str]:
+        for node in root.iter():
+            if IBKRFlexConnector._local_name(node.tag) == tag:
+                return node.text.strip() if node.text else None
+        return None
+
+    @staticmethod
+    def _elements(root: ET.Element, tag: str) -> list[ET.Element]:
+        return [node for node in root.iter() if IBKRFlexConnector._local_name(node.tag) == tag]
+
+    @staticmethod
+    def _local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+    @staticmethod
+    def _headers() -> dict:
+        return {"User-Agent": "Investment-Portfolio-Tracker/1.0"}
+
+    @staticmethod
+    def _value(data: dict, *keys: str) -> str:
+        lowered = {str(k).lower(): v for k, v in data.items()}
+        for key in keys:
+            if key in data and data[key] is not None:
+                return str(data[key]).strip()
+            value = lowered.get(key.lower())
+            if value is not None:
+                return str(value).strip()
+        return ""
+
+    @staticmethod
+    def _clean_symbol(symbol: str) -> str:
+        return (symbol or "").strip().upper().split(" ")[0]
+
+    @staticmethod
+    def _decimal(value: Optional[str]) -> Decimal:
+        if value in (None, ""):
+            return ZERO
+        cleaned = str(value).replace(",", "").replace("$", "").strip()
+        if cleaned.startswith("(") and cleaned.endswith(")"):
+            cleaned = "-" + cleaned[1:-1]
+        try:
+            return Decimal(cleaned)
+        except Exception:
+            return ZERO
+
+    @classmethod
+    def _maybe_decimal(cls, value: Optional[str]) -> Optional[Decimal]:
+        if value in (None, ""):
+            return None
+        return cls._decimal(value)
+
+    @staticmethod
+    def _map_cash_type(raw_type: str, description: str) -> Optional[str]:
+        text = f"{raw_type} {description}".lower()
+        if "dividend" in text or raw_type in {"dividends", "payment in lieu of dividends"}:
+            return "DIVIDEND"
+        if "withholding" in text or "withheld" in text:
+            return "FEE"
+        if "interest" in text:
+            return "INTEREST"
+        if "fee" in text or "commission" in text:
+            return "FEE"
+        if "deposit" in text:
+            return "DEPOSIT"
+        if "withdrawal" in text:
+            return "WITHDRAWAL"
+        return None
+
+    @staticmethod
+    def _parse_ibkr_date(value: Optional[str]) -> datetime:
+        if not value:
+            return datetime.now(timezone.utc)
+        cleaned = value.strip().replace(";", " ")
+        for fmt in (
+            "%Y%m%d",
+            "%Y%m%d %H:%M:%S",
+            "%Y-%m-%d",
+            "%Y-%m-%d %H:%M:%S",
+            "%m/%d/%Y",
+            "%m/%d/%Y %H:%M:%S",
+        ):
+            try:
+                return datetime.strptime(cleaned.split(".")[0], fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        try:
+            dt = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return datetime.now(timezone.utc)
 
     @staticmethod
     def _decrypt(encrypted: Optional[bytes]) -> str:

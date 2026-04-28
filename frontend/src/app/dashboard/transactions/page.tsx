@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api } from "@/lib/api/client";
+import { api, apiSlow } from "@/lib/api/client";
 import { formatCurrency, formatDate } from "@/lib/utils/formatters";
 import {
   Plus, Upload, X, ChevronDown, ChevronRight, Trash2,
@@ -86,6 +86,13 @@ interface BrokerInfo {
   notes?: string;
   supportsApiSync?: boolean;
   apiProvider?: string;
+  apiCredentialType?: "exchange_key" | "ibkr_flex";
+  apiPanelTitle?: string;
+  apiKeyLabel?: string;
+  apiKeyPlaceholder?: string;
+  apiSecretLabel?: string;
+  apiSecretPlaceholder?: string;
+  apiWarning?: string;
   apiInstructions?: string[];
 }
 
@@ -142,6 +149,27 @@ const BROKERS: BrokerInfo[] = [
     ],
     fileTypes: "CSV",
     notes: "For dividend and distribution data, also export the 'Dividends' and 'Payments in Lieu of Dividends' sections in your Flex Query.",
+    supportsApiSync: true,
+    apiProvider: "IBKR",
+    apiCredentialType: "ibkr_flex",
+    apiPanelTitle: "How to set up IBKR Flex Web Service",
+    apiKeyLabel: "Flex Query ID",
+    apiKeyPlaceholder: "e.g. 123456",
+    apiSecretLabel: "Flex Web Service Token",
+    apiSecretPlaceholder: "Paste your IBKR Flex token",
+    apiWarning: "Use an Activity Flex Query in XML format. The token/query ID only grants statement-report access; do not share your IBKR username, password, or trading session.",
+    apiInstructions: [
+      "Login to the IBKR Client Portal",
+      "Go to Performance & Reports > Flex Queries",
+      "Create a new Activity Flex Query or edit an existing one",
+      "In Sections, include Trades > Executions and Cash Transactions",
+      "For dividend tracking, make sure Cash Transactions includes Dividends, Withholding Tax, Interest, Fees and Deposits/Withdrawals",
+      "Set the Period to include your full investing history, or use a rolling range only after you have imported history once",
+      "Under General Configuration, set Format to XML and Date Format to yyyyMMdd",
+      "Save the query, then copy its Flex Query ID",
+      "Go to Performance & Reports > Flex Web Service",
+      "Enable Flex Web Service if needed, generate/copy the Current Token, then paste the Query ID and Token below",
+    ],
   },
   {
     id: "stake",
@@ -391,6 +419,11 @@ function ApiSyncPanel({
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncResult, setSyncResult] = useState<{ imported: number; error?: string } | null>(null);
   const queryClient = useQueryClient();
+  const isIbkrFlex = broker.apiCredentialType === "ibkr_flex";
+  const apiKeyLabel = broker.apiKeyLabel ?? "API Key";
+  const apiSecretLabel = broker.apiSecretLabel ?? "Private Key (Secret)";
+  const apiKeyPlaceholder = broker.apiKeyPlaceholder ?? "Enter your API Key";
+  const apiSecretPlaceholder = broker.apiSecretPlaceholder ?? "Enter your Private Key";
 
   const existingAccount = accounts.find(
     (a: any) => !a.name.startsWith(DEMO_PREFIX) && (a.institution_name === broker.label || a.name === broker.label)
@@ -417,7 +450,7 @@ function ApiSyncPanel({
 
   const handleConnect = async () => {
     if (!apiKey.trim() || !apiSecret.trim()) {
-      toast.error("Please enter both API Key and Private Key");
+      toast.error(`Please enter both ${apiKeyLabel} and ${apiSecretLabel}`);
       return;
     }
 
@@ -427,17 +460,26 @@ function ApiSyncPanel({
       const accountId = await getOrCreateAccountId();
       if (!accountId) return;
 
-      await api.post("/sync/connect/exchange", {
-        account_id: accountId,
-        provider: broker.apiProvider,
-        api_key: apiKey.trim(),
-        api_secret: apiSecret.trim(),
-      });
+      if (isIbkrFlex) {
+        await api.post("/sync/connect/broker", {
+          account_id: accountId,
+          provider: broker.apiProvider,
+          query_id: apiKey.trim(),
+          access_token: apiSecret.trim(),
+        });
+      } else {
+        await api.post("/sync/connect/exchange", {
+          account_id: accountId,
+          provider: broker.apiProvider,
+          api_key: apiKey.trim(),
+          api_secret: apiSecret.trim(),
+        });
+      }
 
-      toast.success("API credentials saved. Syncing trades...");
+      toast.success("API credentials saved. Syncing transactions...");
 
       setIsSyncing(true);
-      const syncResp = await api.post(`/sync/accounts/${accountId}/trigger`);
+      const syncResp = await apiSlow.post(`/sync/accounts/${accountId}/trigger`);
       const result = syncResp.data;
 
       if (result.error) {
@@ -465,7 +507,7 @@ function ApiSyncPanel({
     setIsSyncing(true);
     setSyncResult(null);
     try {
-      const syncResp = await api.post(`/sync/accounts/${existingAccount.id}/trigger`);
+      const syncResp = await apiSlow.post(`/sync/accounts/${existingAccount.id}/trigger`);
       const result = syncResp.data;
       if (result.error) {
         setSyncResult({ imported: 0, error: result.error });
@@ -489,7 +531,7 @@ function ApiSyncPanel({
         <div className="flex items-center gap-2 mb-2">
           <Key className="w-4 h-4 text-blue-400" />
           <span className="text-sm font-medium text-gray-200">
-            How to get your {broker.label} API Key
+            {broker.apiPanelTitle ?? `How to get your ${broker.label} API Key`}
           </span>
         </div>
         <ol className="space-y-1.5 ml-1">
@@ -504,7 +546,7 @@ function ApiSyncPanel({
         </ol>
         <div className="mt-3 flex items-start gap-2 text-xs text-amber-400 bg-amber-400/10 rounded-lg px-3 py-2">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
-          <span>Only grant read-only permissions. Never enable trading or withdrawal access for third-party apps.</span>
+          <span>{broker.apiWarning ?? "Only grant read-only permissions. Never enable trading or withdrawal access for third-party apps."}</span>
         </div>
       </div>
 
@@ -529,26 +571,26 @@ function ApiSyncPanel({
         </div>
       )}
 
-      {!isConnected && (
+      {(!isConnected || isIbkrFlex) && (
         <div className="space-y-3">
           <div>
-            <label className="block text-xs font-medium text-gray-400 mb-1.5">API Key</label>
+            <label className="block text-xs font-medium text-gray-400 mb-1.5">{apiKeyLabel}</label>
             <input
               type="text"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
-              placeholder="Enter your API Key"
+              placeholder={apiKeyPlaceholder}
               className="w-full px-3 py-2.5 bg-gray-800/60 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30 font-mono"
             />
           </div>
           <div>
-            <label className="block text-xs font-medium text-gray-400 mb-1.5">Private Key (Secret)</label>
+            <label className="block text-xs font-medium text-gray-400 mb-1.5">{apiSecretLabel}</label>
             <div className="relative">
               <input
                 type={showSecret ? "text" : "password"}
                 value={apiSecret}
                 onChange={(e) => setApiSecret(e.target.value)}
-                placeholder="Enter your Private Key"
+                placeholder={apiSecretPlaceholder}
                 className="w-full px-3 py-2.5 bg-gray-800/60 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30 font-mono pr-10"
               />
               <button
@@ -568,12 +610,12 @@ function ApiSyncPanel({
             {isConnecting ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                {isSyncing ? "Syncing trades..." : "Connecting..."}
+                {isSyncing ? "Syncing transactions..." : "Connecting..."}
               </>
             ) : (
               <>
                 <Key className="w-4 h-4" />
-                Connect & Sync
+                {isConnected ? "Update Details & Sync" : "Connect & Sync"}
               </>
             )}
           </button>

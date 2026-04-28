@@ -3,6 +3,7 @@ node_modules/
 frontend/node_modules/
 frontend/.next/
 frontend/out/
+*.tsbuildinfo
 
 # Python
 __pycache__/
@@ -48,8 +49,15 @@ frontend/package-lock.json
 frontend/yarn.lock
 
 # Logs
+
+# AI Analysis Plan
+AI_ANALYSIS_PLAN.md
 *.log
 logs/
+
+# Local Celery beat state
+celerybeat-schedule
+celerybeat-schedule.*
 
 # Coverage / Testing
 .coverage

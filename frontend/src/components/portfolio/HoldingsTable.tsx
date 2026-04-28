@@ -215,7 +215,7 @@ export function HoldingsTable({
       setSortDir((d) => (d === "asc" ? "desc" : "asc"));
     } else {
       setSortKey(key);
-      setSortDir(key === "symbol" || key === "name" ? "asc" : "desc");
+      setSortDir(key === "symbol" ? "asc" : "desc");
     }
   };
 

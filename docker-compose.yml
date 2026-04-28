@@ -10,7 +10,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/docker/init.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-15432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-invest} -d ${POSTGRES_DB:-investment_platform}"]
       interval: 5s
@@ -21,7 +21,7 @@ services:
     image: redis:7-alpine
     command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-16379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -60,7 +60,7 @@ services:
     volumes:
       - ./backend:/app
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8010}:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -116,7 +116,7 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/1
       FLOWER_PORT: 5555
     ports:
-      - "5555:5555"
+      - "${FLOWER_PORT:-5555}:5555"
     depends_on:
       - redis
 
@@ -127,15 +127,15 @@ services:
       dockerfile: Dockerfile
       target: development
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
-      NEXTAUTH_URL: http://localhost:3000
+      NEXT_PUBLIC_API_URL: http://localhost:${BACKEND_PORT:-8010}
+      NEXTAUTH_URL: http://localhost:${FRONTEND_PORT:-3000}
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-dev-nextauth-secret}
     volumes:
       - ./frontend:/app
-      - /app/node_modules
-      - /app/.next
+      - frontend_node_modules:/app/node_modules
+      - frontend_next:/app/.next
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT:-3000}:3000"
     depends_on:
       - backend
     command: npm run dev
@@ -145,3 +145,6 @@ volumes:
     external: true
     name: investment-platform_postgres_data
   redis_data:
+
+  frontend_node_modules:
+  frontend_next:

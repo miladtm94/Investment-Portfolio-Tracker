@@ -1,15 +1,18 @@
+# syntax=docker/dockerfile:1
 FROM node:20-alpine AS base
 WORKDIR /app
 COPY package*.json ./
 
 FROM base AS development
-RUN npm install
+RUN --mount=type=cache,target=/root/.npm \
+    if [ -f package-lock.json ]; then npm ci; else npm install; fi
 COPY . .
 EXPOSE 3000
 CMD ["npm", "run", "dev"]
 
 FROM base AS builder
-RUN npm ci
+RUN --mount=type=cache,target=/root/.npm \
+    if [ -f package-lock.json ]; then npm ci; else npm install; fi
 COPY . .
 RUN npm run build
 

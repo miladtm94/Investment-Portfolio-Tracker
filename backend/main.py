@@ -14,7 +14,7 @@ from config import get_settings
 from database import engine, Base
 
 # Import routers
-from routers import auth, portfolio, transactions, analytics, advisor, tax, sync, market_data, bank_import, trading
+from routers import auth, portfolio, transactions, analytics, advisor, tax, sync, market_data, bank_import, trading, analysis_history
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -74,6 +74,7 @@ app.include_router(sync.router, prefix="/api/v1/sync", tags=["Sync"])
 app.include_router(market_data.router, prefix="/api/v1/market", tags=["Market Data"])
 app.include_router(bank_import.router, tags=["Bank Import"])
 app.include_router(trading.router, prefix="/api/v1/trading", tags=["Trading"])
+app.include_router(analysis_history.router, prefix="/api/v1/analysis", tags=["Analysis History"])
 
 
 @app.get("/health", tags=["Health"])

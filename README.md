@@ -18,6 +18,8 @@ A self-hosted platform for tracking equities, ETFs, and crypto across multiple b
 
 ## Features
 
+![Demo Screenshot](./demo-screenshot.png)
+
 **Portfolio**
 - Import CSV exports from CommSec, IBKR, Kraken, and more — auto-detected and parsed
 - Multi-account view grouped by broker, with active/demo account toggle
@@ -65,6 +67,15 @@ docker compose up -d
 ```
 
 Open [http://localhost:3000](http://localhost:3000) — register, then start importing.
+The backend is published on [http://localhost:8010](http://localhost:8010) by default to avoid common local port conflicts.
+
+For day-to-day Docker use:
+
+```bash
+make serve         # start existing containers
+make rebuild       # rebuild with Docker cache
+make clean-rebuild # full no-cache rebuild, only when needed
+```
 
 **Minimum viable `.env`** (only one AI key needed):
 ```env
@@ -120,9 +131,6 @@ frontend/
 - [ ] Multi-user / team portfolios
 - [ ] Hosted SaaS version
 
-## Contributing
-
-PRs welcome. Open an issue first for significant changes.
 
 ## Disclaimer
 

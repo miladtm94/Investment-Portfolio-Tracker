@@ -27,8 +27,9 @@ class ConnectExchangeRequest(BaseModel):
 
 class ConnectBrokerRequest(BaseModel):
     account_id: str
-    provider: str  # PLAID|SNAPTRADE
+    provider: str  # PLAID|SNAPTRADE|IBKR
     access_token: str
+    query_id: Optional[str] = None
 
 
 class SyncResponse(BaseModel):
@@ -82,6 +83,55 @@ async def connect_exchange(
     await db.commit()
 
     return {"message": "Credentials stored. Initiating sync.", "account_id": body.account_id}
+
+
+@router.post("/connect/broker", response_model=dict, status_code=201)
+async def connect_broker(
+    body: ConnectBrokerRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Store broker API credentials such as IBKR Flex Web Service tokens."""
+    result = await db.execute(
+        select(Account).where(Account.id == body.account_id, Account.user_id == current_user.id)
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    provider = body.provider.upper()
+    credential_type = "FLEX_QUERY" if provider in {"IBKR", "INTERACTIVE_BROKERS"} else "ACCESS_TOKEN"
+    if credential_type == "FLEX_QUERY" and not body.query_id:
+        raise HTTPException(status_code=422, detail="IBKR Flex Query ID is required")
+
+    existing = await db.execute(
+        select(ApiCredential).where(
+            ApiCredential.user_id == current_user.id,
+            ApiCredential.provider == provider,
+            ApiCredential.credential_type == credential_type,
+        )
+    )
+    cred = existing.scalar_one_or_none()
+
+    if cred:
+        cred.account_id = body.account_id
+        cred.encrypted_access_token = body.access_token.encode()
+        cred.encrypted_api_key = (body.query_id or "").encode()
+        cred.is_active = True
+    else:
+        cred = ApiCredential(
+            user_id=current_user.id,
+            account_id=body.account_id,
+            provider=provider,
+            credential_type=credential_type,
+            encrypted_access_token=body.access_token.encode(),
+            encrypted_api_key=(body.query_id or "").encode(),
+            encryption_key_id="default",
+        )
+        db.add(cred)
+
+    await db.commit()
+
+    return {"message": "Broker credentials stored. Initiating sync.", "account_id": body.account_id}
 
 
 @router.post("/accounts/{account_id}/trigger", response_model=SyncResponse)
@@ -150,7 +200,7 @@ async def refresh_all(
         select(ApiCredential).where(
             ApiCredential.user_id == current_user.id,
             ApiCredential.is_active == True,
-            ApiCredential.credential_type == "API_KEY",
+            ApiCredential.account_id.isnot(None),
         )
     )
     credentials = cred_result.scalars().all()
