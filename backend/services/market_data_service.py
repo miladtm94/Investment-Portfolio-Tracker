@@ -112,12 +112,14 @@ class MarketDataService:
         symbol: str,
         start_date: datetime,
         end_date: datetime,
+        currency: str = "USD",
     ) -> list[dict]:
         """
         Get daily OHLCV prices for a symbol over a date range.
         Returns list of {date, open, high, low, close, volume}.
         """
-        cache_key = f"market:history:{symbol}:{start_date.date()}:{end_date.date()}"
+        cache_suffix = ":AX" if currency.upper() == "AUD" else ""
+        cache_key = f"market:history:{symbol}{cache_suffix}:{start_date.date()}:{end_date.date()}"
         cached = await cache_get(cache_key)
         if cached is not None:
             return cached
@@ -125,7 +127,7 @@ class MarketDataService:
         if self._is_crypto(symbol):
             prices = await self._get_crypto_history(symbol, start_date, end_date)
         else:
-            prices = await self._get_equity_history(symbol, start_date, end_date)
+            prices = await self._get_equity_history(symbol, start_date, end_date, currency)
 
         if prices:
             # Cache historical data for longer
@@ -218,14 +220,15 @@ class MarketDataService:
                 continue
         return None
 
-    async def _get_equity_history(self, symbol: str, start: datetime, end: datetime) -> list[dict]:
+    async def _get_equity_history(self, symbol: str, start: datetime, end: datetime, currency: str = "USD") -> list[dict]:
         """Fetch OHLCV from Polygon or Yahoo."""
+        if currency.upper() != "AUD":
+            try:
+                return await self._polygon_history(symbol, start, end)
+            except Exception:
+                pass
         try:
-            return await self._polygon_history(symbol, start, end)
-        except Exception:
-            pass
-        try:
-            return await self._yahoo_history(symbol, start, end)
+            return await self._yahoo_history(symbol, start, end, currency)
         except Exception:
             return []
 
@@ -248,32 +251,43 @@ class MarketDataService:
             for r in data.get("results", [])
         ]
 
-    async def _yahoo_history(self, symbol: str, start: datetime, end: datetime) -> list[dict]:
-        yf_symbol = f"{symbol}.AX" if symbol in self._asx_symbols else symbol
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_symbol}"
+    async def _yahoo_history(self, symbol: str, start: datetime, end: datetime, currency: str = "USD") -> list[dict]:
+        suffixes = (".AX", "") if currency.upper() == "AUD" else ("", ".AX")
         headers = {"User-Agent": "Mozilla/5.0"}
         params = {
             "interval": "1d",
             "period1": int(start.timestamp()),
             "period2": int(end.timestamp()),
         }
-        resp = await self._http.get(url, headers=headers, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        result = data["chart"]["result"][0]
-        timestamps = result["timestamp"]
-        quotes = result["indicators"]["quote"][0]
 
-        return [
-            {
-                "date": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d"),
-                "open": quotes["open"][i], "high": quotes["high"][i],
-                "low": quotes["low"][i], "close": quotes["close"][i],
-                "volume": quotes["volume"][i],
-            }
-            for i, ts in enumerate(timestamps)
-            if quotes["close"][i] is not None
-        ]
+        for suffix in suffixes:
+            try:
+                yf_symbol = f"{symbol}{suffix}"
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_symbol}"
+                resp = await self._http.get(url, headers=headers, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                result = data["chart"]["result"][0]
+                timestamps = result["timestamp"]
+                quotes = result["indicators"]["quote"][0]
+                rows = [
+                    {
+                        "date": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d"),
+                        "open": quotes["open"][i], "high": quotes["high"][i],
+                        "low": quotes["low"][i], "close": quotes["close"][i],
+                        "volume": quotes["volume"][i],
+                    }
+                    for i, ts in enumerate(timestamps)
+                    if quotes["close"][i] is not None
+                ]
+                if rows:
+                    if suffix == ".AX":
+                        self._asx_symbols.add(symbol)
+                    return rows
+            except Exception as e:
+                logger.debug(f"Yahoo history {symbol}{suffix}: {e}")
+                continue
+        return []
 
     # ─── Crypto Providers ────────────────────────────────────────────────
 

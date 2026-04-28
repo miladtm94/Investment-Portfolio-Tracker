@@ -105,7 +105,9 @@ class AnalyticsEngine:
         portfolio_series = await self._build_portfolio_series(
             user_id, start, end, account_ids, display_currency=display_currency
         )
-        benchmark_series = await self._build_benchmark_series(benchmark_symbol, start, end)
+        benchmark_series = await self._build_benchmark_series(
+            benchmark_symbol, start, end, display_currency=display_currency
+        )
 
         performance = self._compute_performance(portfolio_series, benchmark_series, current)
         risk = self._compute_risk(portfolio_series, benchmark_series)
@@ -345,14 +347,18 @@ class AnalyticsEngine:
         if not current.holdings:
             return pd.Series(dtype=float)
 
-        # Build price history for all holdings with market value
-        symbols = [h.symbol for h in current.holdings if h.market_value]
+        # Build price history for all holdings with market value. original_currency
+        # is the quote currency returned by MarketDataService, not necessarily the
+        # currency used for every historical purchase lot.
+        holdings_by_symbol = {h.symbol: h for h in current.holdings if h.market_value}
+        symbols = list(holdings_by_symbol)
         all_prices: dict[str, list[dict]] = {}
 
         logger.info(f"Building portfolio series for {len(symbols)} symbols from {start.date()} to {end.date()}")
         for sym in symbols:
             try:
-                prices = await self.market_data.get_historical_prices(sym, start, end)
+                sym_ccy = FXService._normalize_currency(holdings_by_symbol[sym].original_currency or "USD")
+                prices = await self.market_data.get_historical_prices(sym, start, end, currency=sym_ccy)
                 if prices:
                     all_prices[sym] = prices
                 else:
@@ -374,9 +380,7 @@ class AnalyticsEngine:
             df = pd.DataFrame(prices)
             df["date"] = pd.to_datetime(df["date"])
             df = df.set_index("date")[["close"]].rename(columns={"close": sym})
-            sym_ccy = FXService._normalize_currency(
-                next((h.original_currency for h in current.holdings if h.symbol == sym), "USD")
-            )
+            sym_ccy = FXService._normalize_currency(holdings_by_symbol[sym].original_currency or "USD")
             if sym_ccy != display_ccy:
                 unique_days = df.index.date
                 for day in pd.unique(unique_days):
@@ -413,14 +417,36 @@ class AnalyticsEngine:
         await fx.close()
         return portfolio_values.dropna()
 
-    async def _build_benchmark_series(self, symbol: str, start: datetime, end: datetime) -> pd.Series:
-        prices = await self.market_data.get_historical_prices(symbol, start, end)
+    async def _build_benchmark_series(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        display_currency: str = "AUD",
+    ) -> pd.Series:
+        benchmark_ccy = "AUD" if symbol.upper().endswith(".AX") else "USD"
+        clean_symbol = symbol[:-3] if symbol.upper().endswith(".AX") else symbol
+        prices = await self.market_data.get_historical_prices(clean_symbol, start, end, currency=benchmark_ccy)
         if not prices:
             return pd.Series(dtype=float)
         df = pd.DataFrame(prices)
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date")
-        return df["close"].dropna()
+        series = df["close"].dropna()
+
+        display_ccy = FXService._normalize_currency(display_currency)
+        if benchmark_ccy == display_ccy or series.empty:
+            return series
+
+        fx = FXService()
+        try:
+            rates: dict[str, float] = {}
+            for day in pd.unique(series.index.date):
+                dt = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+                rates[day.isoformat()] = float(await fx.get_rate_on_date(benchmark_ccy, display_ccy, dt))
+            return series * series.index.to_series().apply(lambda d: rates[d.date().isoformat()]).to_numpy()
+        finally:
+            await fx.close()
 
     @staticmethod
     def _period_to_dates(period: str) -> tuple[datetime, datetime]:

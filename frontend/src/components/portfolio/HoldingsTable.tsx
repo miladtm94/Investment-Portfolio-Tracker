@@ -70,16 +70,6 @@ const COLUMNS: {
   { key: "weight_pct", label: "Weight", align: "right" },
 ];
 
-// ─── Helper: plain dollar format ───────────────────────────────────────────
-const fmtDollar = (value: number) => {
-  const num = new Intl.NumberFormat("en-AU", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(Math.abs(value));
-  const sign = value < 0 ? "-" : "";
-  return `${sign}$${num}`;
-};
-
 const fmtDate = (iso: string) =>
   new Date(iso).toLocaleDateString("en-AU", {
     day: "numeric",
@@ -260,6 +250,7 @@ export function HoldingsTable({
   }, [filtered, showTotals]);
 
   const isToggled = currency !== "AUD";
+  const fmtMoney = (value: number) => formatCurrency(value, false, currency);
 
   if (loading) {
     return (
@@ -372,7 +363,7 @@ export function HoldingsTable({
 
                   {/* Price */}
                   <td className="py-3 pr-3 text-right font-mono text-gray-300">
-                    {h.last_price ? fmtDollar(h.last_price) : "—"}
+                    {h.last_price ? fmtMoney(h.last_price) : "—"}
                   </td>
 
                   {/* Quantity */}
@@ -382,7 +373,7 @@ export function HoldingsTable({
 
                   {/* Value */}
                   <td className="py-3 pr-3 text-right font-mono font-medium text-gray-100">
-                    {h.market_value ? fmtDollar(h.market_value) : "—"}
+                    {h.market_value ? fmtMoney(h.market_value) : "—"}
                   </td>
 
                   {/* P/L */}
@@ -395,7 +386,7 @@ export function HoldingsTable({
                         )}
                       >
                         {gainPositive ? "+" : ""}
-                        {fmtDollar(h.unrealized_gain)}
+                        {fmtMoney(h.unrealized_gain)}
                       </span>
                     ) : (
                       "—"
@@ -404,12 +395,12 @@ export function HoldingsTable({
 
                   {/* Avg Cost */}
                   <td className="py-3 pr-3 text-right font-mono text-gray-400">
-                    {h.average_cost_basis ? fmtDollar(h.average_cost_basis) : "—"}
+                    {h.average_cost_basis ? fmtMoney(h.average_cost_basis) : "—"}
                   </td>
 
                   {/* Cost Basis */}
                   <td className="py-3 pr-3 text-right font-mono text-gray-400">
-                    {h.total_cost_basis ? fmtDollar(h.total_cost_basis) : "—"}
+                    {h.total_cost_basis ? fmtMoney(h.total_cost_basis) : "—"}
                   </td>
 
                   {/* Return % */}

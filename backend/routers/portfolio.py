@@ -64,7 +64,7 @@ class HoldingResponse(BaseModel):
     unrealized_gain: Optional[float]
     unrealized_gain_pct: Optional[float]
     currency: str
-    original_currency: str = "AUD"  # Asset's native trading currency
+    original_currency: str = "AUD"  # Quote currency used for current market prices
 
 
 class PortfolioSummaryResponse(BaseModel):
@@ -89,13 +89,13 @@ def _to_holding_response(h: HoldingSnapshot, total_mv: Decimal) -> HoldingRespon
         name=h.name,
         asset_class=h.asset_class,
         quantity=float(h.quantity),
-        average_cost_basis=float(h.average_cost_basis) if h.average_cost_basis else None,
-        total_cost_basis=float(h.total_cost_basis) if h.total_cost_basis else None,
-        last_price=float(h.last_price) if h.last_price else None,
+        average_cost_basis=float(h.average_cost_basis) if h.average_cost_basis is not None else None,
+        total_cost_basis=float(h.total_cost_basis) if h.total_cost_basis is not None else None,
+        last_price=float(h.last_price) if h.last_price is not None else None,
         market_value=mv,
         weight_pct=round(weight, 2) if weight is not None else None,
-        unrealized_gain=float(h.unrealized_gain) if h.unrealized_gain else None,
-        unrealized_gain_pct=float(h.unrealized_gain_pct) if h.unrealized_gain_pct else None,
+        unrealized_gain=float(h.unrealized_gain) if h.unrealized_gain is not None else None,
+        unrealized_gain_pct=float(h.unrealized_gain_pct) if h.unrealized_gain_pct is not None else None,
         currency=h.currency,
         original_currency=getattr(h, 'original_currency', h.currency),
     )

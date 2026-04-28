@@ -33,7 +33,7 @@ export interface PortfolioSummary {
 
 export function usePortfolioSummary(accountIds?: string[], currency: string = "AUD") {
   const searchParams = new URLSearchParams();
-  if (accountIds?.length) searchParams.set("account_ids", accountIds.join(","));
+  accountIds?.forEach((id) => searchParams.append("account_ids", id));
   if (currency && currency !== "AUD") searchParams.set("currency", currency);
   const qs = searchParams.toString();
   const url = `/portfolio/summary${qs ? `?${qs}` : ""}`;
@@ -96,4 +96,3 @@ export function useHoldingTransactions(symbol: string | null) {
     staleTime: 60 * 1000,
   });
 }
-
