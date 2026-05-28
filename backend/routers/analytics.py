@@ -1,5 +1,7 @@
 """Analytics router — performance, risk, allocation metrics."""
 from typing import Optional
+
+import pandas as pd
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import select, func
@@ -13,6 +15,11 @@ from services.portfolio_engine import PortfolioEngine
 from services.market_data_service import MarketDataService
 
 router = APIRouter()
+
+BENCHMARK_METADATA = {
+    "SPY": {"key": "sp500", "label": "S&P 500"},
+    "BTC": {"key": "btc", "label": "BTC"},
+}
 
 
 class PerformanceResponse(BaseModel):
@@ -147,13 +154,13 @@ async def get_portfolio_value_history(
     period: str = Query("1Y"),
     start_date: Optional[str] = Query(None, description="Custom start (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="Custom end (YYYY-MM-DD)"),
+    benchmarks: str = Query("SPY,BTC", description="Comma-separated benchmark tickers"),
     currency: Optional[str] = Query(None, description="Display currency (AUD|USD)"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get daily portfolio value timeseries for charting."""
+    """Get daily portfolio value timeseries and optional comparison benchmarks."""
     from datetime import datetime as dt, timezone as tz, timedelta
-    engine = _get_engine(db)
     if start_date and end_date:
         start = dt.strptime(start_date, "%Y-%m-%d").replace(tzinfo=tz.utc)
         end = dt.strptime(end_date, "%Y-%m-%d").replace(tzinfo=tz.utc)
@@ -178,21 +185,84 @@ async def get_portfolio_value_history(
     portfolio_engine = PortfolioEngine(db, MarketDataService())
     analytics = AnalyticsEngine(portfolio_engine, MarketDataService())
     active_ids = await _active_account_ids(current_user.id, db)
-    series = await analytics._build_portfolio_series(
+    display_ccy = currency.upper() if currency else "AUD"
+    benchmark_symbols = _parse_benchmark_symbols(benchmarks)
+    series, benchmark_series = await analytics.build_portfolio_comparison_series(
         current_user.id,
         start,
         end,
-        active_ids or None,
-        display_currency=currency.upper() if currency else "AUD",
+        benchmark_symbols=benchmark_symbols,
+        account_ids=active_ids or None,
+        display_currency=display_ccy,
     )
 
     if series.empty:
-        return {"data": [], "period": period}
+        return {
+            "data": [],
+            "period": period,
+            "benchmarks": [],
+            "value_mode": "benchmarks_indexed_to_portfolio_start",
+        }
+
+    benchmark_payload = []
+    benchmark_keys: dict[str, str] = {}
+    for symbol, values in benchmark_series.items():
+        meta = _benchmark_metadata(symbol, values)
+        benchmark_payload.append(meta)
+        benchmark_keys[symbol] = meta["key"]
 
     return {
-        "data": [
-            {"date": str(date.date()), "value": round(float(val), 2)}
-            for date, val in series.items()
-        ],
+        "data": _build_value_history_rows(series, benchmark_series, benchmark_keys),
         "period": period,
+        "benchmarks": benchmark_payload,
+        "value_mode": "benchmarks_indexed_to_portfolio_start",
     }
+
+
+def _parse_benchmark_symbols(raw: str) -> list[str]:
+    symbols: list[str] = []
+    for part in raw.split(","):
+        symbol = part.strip().upper()
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    return symbols[:5]
+
+
+def _benchmark_metadata(symbol: str, series: pd.Series) -> dict:
+    predefined = BENCHMARK_METADATA.get(symbol.upper(), {})
+    key = predefined.get("key") or _benchmark_key(symbol)
+    return_pct = None
+    clean = series.dropna()
+    if len(clean) >= 2 and float(clean.iloc[0]) != 0:
+        return_pct = round((float(clean.iloc[-1]) / float(clean.iloc[0]) - 1) * 100, 4)
+
+    return {
+        "key": key,
+        "symbol": symbol,
+        "label": predefined.get("label") or symbol,
+        "return_pct": return_pct,
+    }
+
+
+def _benchmark_key(symbol: str) -> str:
+    clean = "".join(ch.lower() if ch.isalnum() else "_" for ch in symbol)
+    clean = "_".join(part for part in clean.split("_") if part)
+    return f"benchmark_{clean or 'series'}"
+
+
+def _build_value_history_rows(
+    series: pd.Series,
+    benchmark_series: dict[str, pd.Series],
+    benchmark_keys: dict[str, str],
+) -> list[dict]:
+    rows = []
+    for date, val in series.items():
+        row = {"date": str(date.date()), "value": round(float(val), 2)}
+        for symbol, benchmark in benchmark_series.items():
+            if date not in benchmark.index:
+                continue
+            bench_val = benchmark.loc[date]
+            if pd.notna(bench_val):
+                row[benchmark_keys[symbol]] = round(float(bench_val), 2)
+        rows.append(row)
+    return rows

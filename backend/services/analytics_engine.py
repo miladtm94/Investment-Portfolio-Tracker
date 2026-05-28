@@ -448,6 +448,85 @@ class AnalyticsEngine:
         finally:
             await fx.close()
 
+    async def build_portfolio_comparison_series(
+        self,
+        user_id: str,
+        start: datetime,
+        end: datetime,
+        benchmark_symbols: list[str],
+        account_ids: list[str] | None = None,
+        display_currency: str = "AUD",
+    ) -> tuple[pd.Series, dict[str, pd.Series]]:
+        """
+        Build portfolio value plus benchmark curves indexed to the portfolio's
+        first visible value. This keeps the chart in currency terms while making
+        the benchmark lines comparable to the portfolio curve.
+        """
+        portfolio = await self._build_portfolio_series(
+            user_id,
+            start,
+            end,
+            account_ids,
+            display_currency=display_currency,
+        )
+        if portfolio.empty or len(portfolio.dropna()) < 2:
+            return portfolio, {}
+
+        portfolio = portfolio.sort_index().dropna()
+        chart_index = portfolio.index
+        base_value = float(portfolio.iloc[0])
+        benchmarks: dict[str, pd.Series] = {}
+
+        if base_value <= 0:
+            return portfolio, benchmarks
+
+        for symbol in benchmark_symbols:
+            try:
+                benchmark = await self._build_benchmark_series(
+                    symbol,
+                    start,
+                    end,
+                    display_currency=display_currency,
+                )
+                indexed = self._index_benchmark_to_portfolio_base(
+                    benchmark,
+                    chart_index,
+                    base_value,
+                )
+                if not indexed.empty:
+                    benchmarks[symbol] = indexed
+            except Exception as e:
+                logger.warning(f"Failed to build benchmark comparison for {symbol}: {e}")
+
+        return portfolio, benchmarks
+
+    @staticmethod
+    def _index_benchmark_to_portfolio_base(
+        benchmark: pd.Series,
+        chart_index: pd.Index,
+        base_value: float,
+    ) -> pd.Series:
+        """Normalize a benchmark onto the portfolio chart's date index."""
+        if benchmark.empty or len(chart_index) == 0 or base_value <= 0:
+            return pd.Series(dtype=float)
+
+        benchmark = benchmark.sort_index().dropna()
+        benchmark = benchmark[~benchmark.index.duplicated(keep="last")]
+        if benchmark.empty:
+            return pd.Series(dtype=float)
+
+        aligned = (
+            benchmark.reindex(chart_index.union(benchmark.index))
+            .sort_index()
+            .ffill()
+            .reindex(chart_index)
+            .dropna()
+        )
+        if aligned.empty or float(aligned.iloc[0]) == 0:
+            return pd.Series(dtype=float)
+
+        return (aligned / float(aligned.iloc[0])) * base_value
+
     @staticmethod
     def _period_to_dates(period: str) -> tuple[datetime, datetime]:
         end = datetime.now(timezone.utc)

@@ -138,8 +138,10 @@ export default function AnalyticsPage() {
       </div>
 
       {/* Charts */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <PortfolioValueChart period={period} currency={displayCurrency} />
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+        <div className="xl:col-span-2">
+          <PortfolioValueChart period={period} currency={displayCurrency} />
+        </div>
         <AllocationPie
           data={data?.allocation.by_asset_class}
           title="Asset Class Allocation"
