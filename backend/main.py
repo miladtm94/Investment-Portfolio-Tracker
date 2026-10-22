@@ -50,13 +50,17 @@ app = FastAPI(
 )
 
 # ─── Middleware ────────────────────────────────────────────────────────────────
+# Allowed origins come from FRONTEND_PORT + CORS_ORIGINS (see config.py).
+# Vercel previews need a regex — allow_origins does not expand wildcards.
+cors_origin_regex = r"https://[a-z0-9-]+\.vercel\.app"
+if settings.environment == "development":
+    # Any local port, so changing FRONTEND_PORT never breaks login in dev
+    cors_origin_regex += r"|http://(localhost|127\.0\.0\.1)(:\d+)?"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://*.vercel.app",       # Vercel preview + production
-        "https://app.yourdomain.com", # custom domain (optional)
-    ],
+    allow_origins=settings.cors_origin_list,
+    allow_origin_regex=cors_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

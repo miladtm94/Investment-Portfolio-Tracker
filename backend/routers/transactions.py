@@ -6,27 +6,32 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+API_TRANSACTION_SOURCES = {"KRAKEN_API", "COINBASE", "BINANCE", "IBKR_API", "PLAID"}
+
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, desc
 
 from database import get_db
-from shared.models import Account, Asset, Transaction, User
+from shared.models import Account, ApiCredential, Asset, Transaction, User
+from shared.assets import get_or_create_asset
 from shared.auth import get_current_user
 from shared.cache import cache_invalidate_user
 from services.transaction_import import TransactionImporter
+from services.fx_service import enrich_transaction_with_aud
 
 router = APIRouter()
 
 
 class TransactionCreate(BaseModel):
     account_id: str
-    asset_symbol: str
+    asset_symbol: Optional[str] = None
     transaction_type: str
     quantity: Optional[float] = None
     price_per_unit: Optional[float] = None
     fees: float = 0.0
+    net_amount: Optional[float] = None
     currency: str = "USD"
     transacted_at: datetime
     notes: Optional[str] = None
@@ -146,34 +151,74 @@ async def create_transaction(
     acct_result = await db.execute(
         select(Account).where(Account.id == body.account_id, Account.user_id == current_user.id)
     )
-    if not acct_result.scalar_one_or_none():
+    account = acct_result.scalar_one_or_none()
+    if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    # Resolve or create asset
-    asset_result = await db.execute(select(Asset).where(Asset.symbol == body.asset_symbol.upper()))
-    asset = asset_result.scalar_one_or_none()
-    if not asset:
-        asset = Asset(symbol=body.asset_symbol.upper(), name=body.asset_symbol.upper(), asset_class="EQUITY", currency="USD")
-        db.add(asset)
-        await db.flush()
+    api_result = await db.execute(
+        select(ApiCredential.id).where(
+            ApiCredential.account_id == body.account_id,
+            ApiCredential.user_id == current_user.id,
+            ApiCredential.is_active == True,
+        )
+    )
+    if api_result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=403,
+            detail="Manual transactions are disabled for API-connected accounts. Sync the account from its provider instead.",
+        )
+
+    txn_type = body.transaction_type.upper()
+    symbol = body.asset_symbol.strip().upper() if body.asset_symbol else None
+    asset_required_types = {
+        "BUY", "SELL", "DIVIDEND", "DISTRIBUTION", "STAKE_REWARD",
+        "TRANSFER_IN", "TRANSFER_OUT", "AIRDROP", "MINING_REWARD", "SPLIT", "SWAP",
+    }
+    if txn_type in asset_required_types and not symbol:
+        raise HTTPException(status_code=422, detail=f"Asset symbol is required for {txn_type} transactions")
+
+    asset = None
+    if symbol:
+        asset_class = "CRYPTO" if account.account_type == "CRYPTO_EXCHANGE" else "EQUITY"
+        asset = await get_or_create_asset(db, symbol, body.currency, asset_class)
 
     qty = Decimal(str(body.quantity)) if body.quantity else None
     price = Decimal(str(body.price_per_unit)) if body.price_per_unit else None
     fees = Decimal(str(body.fees))
+    manual_net = Decimal(str(body.net_amount)) if body.net_amount is not None else None
 
-    net = None
-    if qty and price:
-        net = qty * price - fees if body.transaction_type == "SELL" else -(qty * price + fees)
+    net = manual_net
+    if net is None and qty and price:
+        if txn_type == "SELL":
+            net = qty * price - fees
+        elif txn_type in {"DIVIDEND", "DISTRIBUTION", "INTEREST"}:
+            net = qty * price - fees
+        elif txn_type in {"BUY", "TRANSFER_IN", "STAKE_REWARD", "AIRDROP", "MINING_REWARD"}:
+            net = -(qty * price + fees)
+    if net is None and txn_type == "FEE" and fees:
+        net = -fees
+
+    fx_data = await enrich_transaction_with_aud(
+        body.currency.upper(),
+        qty,
+        price,
+        net,
+        body.transacted_at,
+    )
 
     txn = Transaction(
         account_id=body.account_id,
         user_id=current_user.id,
-        asset_id=asset.id,
-        transaction_type=body.transaction_type.upper(),
+        asset_id=asset.id if asset else None,
+        transaction_type=txn_type,
         quantity=qty,
         price_per_unit=price,
+        dividend_per_share=price if txn_type in {"DIVIDEND", "DISTRIBUTION"} else None,
         fees=fees,
         net_amount=net,
+        fx_rate_to_aud=fx_data["fx_rate_to_aud"],
+        net_amount_aud=fx_data["net_amount_aud"],
+        price_per_unit_aud=fx_data["price_per_unit_aud"],
         currency=body.currency.upper(),
         transacted_at=body.transacted_at,
         source="MANUAL",
@@ -186,10 +231,10 @@ async def create_transaction(
 
     return TransactionResponse(
         id=txn.id, account_id=txn.account_id, asset_id=txn.asset_id,
-        symbol=asset.symbol, transaction_type=txn.transaction_type,
+        symbol=asset.symbol if asset else None, transaction_type=txn.transaction_type,
         quantity=float(txn.quantity) if txn.quantity else None,
         price_per_unit=float(txn.price_per_unit) if txn.price_per_unit else None,
-        fees=float(txn.fees), net_amount=float(txn.net_amount) if txn.net_amount else None,
+        fees=float(txn.fees or 0), net_amount=float(txn.net_amount) if txn.net_amount else None,
         currency=txn.currency,
         fx_rate_to_aud=float(txn.fx_rate_to_aud) if txn.fx_rate_to_aud else None,
         net_amount_aud=float(txn.net_amount_aud) if txn.net_amount_aud else None,
@@ -211,6 +256,26 @@ async def delete_transaction(
     txn = result.scalar_one_or_none()
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found")
+
+    if txn.source in API_TRANSACTION_SOURCES:
+        raise HTTPException(
+            status_code=403,
+            detail="API-synced transactions are read-only. Delete or correct them at the provider, then re-sync.",
+        )
+
+    api_result = await db.execute(
+        select(ApiCredential.id).where(
+            ApiCredential.account_id == txn.account_id,
+            ApiCredential.user_id == current_user.id,
+            ApiCredential.is_active == True,
+        )
+    )
+    if api_result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=403,
+            detail="Transactions in API-connected accounts are read-only. Sync the account from its provider instead.",
+        )
+
     await db.delete(txn)
     await db.commit()
     await cache_invalidate_user(current_user.id)
@@ -220,6 +285,7 @@ async def delete_transaction(
 async def import_transactions(
     file: UploadFile = File(...),
     account_id: str = Form(...),
+    broker_hint: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -253,6 +319,7 @@ async def import_transactions(
             file_name=filename,
             account_id=account_id,
             user_id=current_user.id,
+            broker_hint=broker_hint,
         )
     except Exception as exc:
         logger.error("Import failed for account %s: %s", account_id, exc)

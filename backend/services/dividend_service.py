@@ -228,17 +228,17 @@ class DividendService:
             "ticker": ticker,
             "ex_dividend_date.gte": start_date.strftime("%Y-%m-%d"),
             "limit": 1000,
-            "apiKey": api_key,
         }
+        headers = {"Authorization": f"Bearer {api_key}"}
 
         results: list[dict] = []
         next_url: Optional[str] = None
 
         while True:
             if next_url:
-                resp = await self._http.get(next_url, params={"apiKey": api_key})
+                resp = await self._http.get(next_url, headers=headers)
             else:
-                resp = await self._http.get(url, params=params)
+                resp = await self._http.get(url, params=params, headers=headers)
             resp.raise_for_status()
             payload = resp.json()
             results.extend(payload.get("results", []))

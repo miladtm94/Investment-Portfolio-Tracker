@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, apiSlow } from "@/lib/api/client";
 import { formatCurrency, formatDate } from "@/lib/utils/formatters";
@@ -42,6 +42,94 @@ const TYPE_LABELS: Record<string, string> = {
   WITHDRAWAL: "Withdrawal",
   INTEREST: "Interest",
 };
+
+const MANUAL_TRANSACTION_TYPES = [
+  "BUY",
+  "SELL",
+  "DIVIDEND",
+  "DISTRIBUTION",
+  "TRANSFER_IN",
+  "TRANSFER_OUT",
+  "FEE",
+  "DEPOSIT",
+  "WITHDRAWAL",
+  "INTEREST",
+] as const;
+
+const API_TRANSACTION_SOURCES = new Set(["KRAKEN_API", "COINBASE", "BINANCE", "IBKR_API", "PLAID"]);
+const ASSET_REQUIRED_TYPES = new Set([
+  "BUY",
+  "SELL",
+  "DIVIDEND",
+  "DISTRIBUTION",
+  "TRANSFER_IN",
+  "TRANSFER_OUT",
+]);
+
+type ManualTransactionForm = {
+  transacted_at: string;
+  transaction_type: string;
+  asset_symbol: string;
+  quantity: string;
+  price_per_unit: string;
+  fees: string;
+  net_amount: string;
+  currency: string;
+  notes: string;
+};
+
+type PayoutProjection = {
+  symbol: string;
+  transaction_type: string;
+  next_date: string;
+  cadence_months: number;
+  quantity: number | null;
+  price_per_unit: number | null;
+  net_amount: number;
+  currency: string;
+};
+
+function initialManualForm(currency: string): ManualTransactionForm {
+  return {
+    transacted_at: new Date().toISOString().slice(0, 10),
+    transaction_type: "BUY",
+    asset_symbol: "",
+    quantity: "",
+    price_per_unit: "",
+    fees: "0",
+    net_amount: "",
+    currency,
+    notes: "",
+  };
+}
+
+function toDateInput(value: string | Date): string {
+  return new Date(value).toISOString().slice(0, 10);
+}
+
+function addMonths(dateStr: string, months: number): string {
+  const date = new Date(`${dateStr}T12:00:00`);
+  const originalDay = date.getDate();
+  date.setMonth(date.getMonth() + months);
+  if (date.getDate() < originalDay) {
+    date.setDate(0);
+  }
+  return date.toISOString().slice(0, 10);
+}
+
+function monthDiff(a: string, b: string): number {
+  const first = new Date(`${a}T12:00:00`);
+  const second = new Date(`${b}T12:00:00`);
+  return (second.getFullYear() - first.getFullYear()) * 12 + second.getMonth() - first.getMonth();
+}
+
+function inferCadenceMonths(sortedDates: string[]): number {
+  if (sortedDates.length < 2) return 3;
+  const diff = monthDiff(sortedDates[sortedDates.length - 2], sortedDates[sortedDates.length - 1]);
+  if (diff <= 4) return 3;
+  if (diff <= 8) return 6;
+  return 12;
+}
 
 // Demo account prefix — accounts with this name prefix are treated as demo
 const DEMO_PREFIX = "Demo - ";
@@ -94,9 +182,26 @@ interface BrokerInfo {
   apiSecretPlaceholder?: string;
   apiWarning?: string;
   apiInstructions?: string[];
+  allowPortfolioName?: boolean;
 }
 
 const BROKERS: BrokerInfo[] = [
+  {
+    id: "betashares_direct",
+    label: "Betashares Direct",
+    country: "AU",
+    currency: "AUD",
+    instructions: [
+      "Login to the Betashares Direct web app (the export is not currently available through a public investor API)",
+      "Open Activity and set the start date early enough to include your complete transaction history",
+      "Select Export to download the full Activity CSV",
+      "For holdings transferred from another broker, make sure the original parcel purchase dates and cost bases have been recorded in Betashares Direct",
+      "Upload the CSV below; fractional ASX units are supported",
+    ],
+    fileTypes: "Activity CSV",
+    notes: "Consolidated holdings: import into one Betashares account here, then exclude the old portfolio accounts from Dashboard calculations to avoid double-counting. Keep the old records until you have confirmed every transferred parcel and cost base.",
+    allowPortfolioName: true,
+  },
   {
     id: "commsec",
     label: "CommSec",
@@ -256,10 +361,16 @@ function BrokerUploadPanel({
 }) {
   const [showInstructions, setShowInstructions] = useState(true);
   const [isCreating, setIsCreating] = useState(false);
+  const [portfolioName, setPortfolioName] = useState(broker.label);
   const queryClient = useQueryClient();
 
-  const existingAccount = accounts.find(
-    (a: any) => !a.name.startsWith(DEMO_PREFIX) && (a.institution_name === broker.label || a.name === broker.label)
+  const targetAccountName = portfolioName.trim() || broker.label;
+  const existingAccount = accounts.find((a: any) =>
+    !a.name.startsWith(DEMO_PREFIX) && (
+      broker.allowPortfolioName
+        ? a.name === targetAccountName
+        : a.institution_name === broker.label || a.name === broker.label
+    )
   );
 
   const getOrCreateAccountId = async (): Promise<string | null> => {
@@ -268,7 +379,7 @@ function BrokerUploadPanel({
     setIsCreating(true);
     try {
       const resp = await api.post("/portfolio/accounts", {
-        name: broker.label,
+        name: targetAccountName,
         institution_name: broker.label,
         account_type: broker.id === "kraken" ? "CRYPTO_EXCHANGE" : "BROKERAGE",
         currency: broker.currency,
@@ -302,6 +413,7 @@ function BrokerUploadPanel({
       const formData = new FormData();
       formData.append("file", file);
       formData.append("account_id", accountId);
+      formData.append("broker_hint", broker.id);
 
       const toastId = toast.loading(`Importing ${file.name}…`);
       try {
@@ -318,6 +430,7 @@ function BrokerUploadPanel({
         );
         queryClient.invalidateQueries({ queryKey: ["transactions"] });
         queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+        queryClient.invalidateQueries({ queryKey: ["analytics"] });
         onImportDone();
       } catch (e: any) {
         toast.error(`Import failed: ${e?.response?.data?.detail ?? "Check file format."}`, { id: toastId });
@@ -364,6 +477,24 @@ function BrokerUploadPanel({
       </div>
 
       {/* Account info */}
+      {broker.allowPortfolioName && (
+        <div>
+          <label className="block text-xs font-medium text-gray-400 mb-1.5">
+            Portfolio name
+          </label>
+          <input
+            type="text"
+            value={portfolioName}
+            onChange={(event) => setPortfolioName(event.target.value)}
+            placeholder="e.g. Betashares Direct – Consolidated"
+            className="w-full px-3 py-2.5 bg-gray-800/60 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30"
+          />
+          <p className="mt-1.5 text-xs text-gray-500">
+            Use one name for a consolidated account, or a different name for each Managed or Custom Portfolio export.
+          </p>
+        </div>
+      )}
+
       {existingAccount && (
         <div className="flex items-center gap-2 text-xs text-gray-400 bg-gray-800/30 rounded-lg px-3 py-2 border border-gray-800">
           <span>Importing into existing account: <strong className="text-gray-200">{existingAccount.name}</strong> ({existingAccount.currency})</span>
@@ -417,13 +548,14 @@ function ApiSyncPanel({
   const [showSecret, setShowSecret] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
-  const [syncResult, setSyncResult] = useState<{ imported: number; error?: string } | null>(null);
+  const [syncResult, setSyncResult] = useState<{ imported: number; error?: string; mode?: string } | null>(null);
   const queryClient = useQueryClient();
   const isIbkrFlex = broker.apiCredentialType === "ibkr_flex";
   const apiKeyLabel = broker.apiKeyLabel ?? "API Key";
   const apiSecretLabel = broker.apiSecretLabel ?? "Private Key (Secret)";
   const apiKeyPlaceholder = broker.apiKeyPlaceholder ?? "Enter your API Key";
   const apiSecretPlaceholder = broker.apiSecretPlaceholder ?? "Enter your Private Key";
+  const supportsRecentSync = broker.id === "kraken";
 
   const existingAccount = accounts.find(
     (a: any) => !a.name.startsWith(DEMO_PREFIX) && (a.institution_name === broker.label || a.name === broker.label)
@@ -486,10 +618,11 @@ function ApiSyncPanel({
         setSyncResult({ imported: 0, error: result.error });
         toast.error(`Sync error: ${result.error}`);
       } else {
-        setSyncResult({ imported: result.imported });
+        setSyncResult({ imported: result.imported, mode: result.mode });
         toast.success(`Imported ${result.imported} transaction${result.imported !== 1 ? "s" : ""} from ${broker.label}`);
         queryClient.invalidateQueries({ queryKey: ["transactions"] });
         queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+        queryClient.invalidateQueries({ queryKey: ["analytics"] });
         onImportDone();
       }
     } catch (e: any) {
@@ -507,16 +640,20 @@ function ApiSyncPanel({
     setIsSyncing(true);
     setSyncResult(null);
     try {
-      const syncResp = await apiSlow.post(`/sync/accounts/${existingAccount.id}/trigger`);
+      const syncResp = await apiSlow.post(
+        `/sync/accounts/${existingAccount.id}/trigger${supportsRecentSync ? "?recent=true" : ""}`
+      );
       const result = syncResp.data;
       if (result.error) {
         setSyncResult({ imported: 0, error: result.error });
         toast.error(`Sync error: ${result.error}`);
       } else {
-        setSyncResult({ imported: result.imported });
-        toast.success(`Imported ${result.imported} new transaction${result.imported !== 1 ? "s" : ""}`);
+        setSyncResult({ imported: result.imported, mode: result.mode });
+        const syncScope = result.mode === "recent" ? "recent " : "";
+        toast.success(`Imported ${result.imported} ${syncScope}transaction${result.imported !== 1 ? "s" : ""}`);
         queryClient.invalidateQueries({ queryKey: ["transactions"] });
         queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+        queryClient.invalidateQueries({ queryKey: ["analytics"] });
       }
     } catch (e: any) {
       toast.error(e?.response?.data?.detail ?? "Sync failed");
@@ -565,7 +702,7 @@ function ApiSyncPanel({
               className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 transition-colors disabled:opacity-50"
             >
               {isSyncing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
-              {isSyncing ? "Syncing..." : "Re-sync"}
+              {isSyncing ? "Syncing..." : supportsRecentSync ? "Sync recent" : "Sync account"}
             </button>
           )}
         </div>
@@ -661,14 +798,172 @@ function AccountCard({
   isDemo?: boolean;
 }) {
   const [expanded, setExpanded] = useState(account.is_active);
+  const [showManualForm, setShowManualForm] = useState(false);
+  const [manualForm, setManualForm] = useState<ManualTransactionForm>(() => initialManualForm(account.currency || "AUD"));
+  const queryClient = useQueryClient();
   const isActive = account.is_active;
   const txCount = transactions.length;
   const isInflow = (t: string) =>
     ["BUY", "TRANSFER_IN", "DEPOSIT", "STAKE_REWARD", "DIVIDEND", "DISTRIBUTION", "INTEREST"].includes(t);
+  const isApiManaged =
+    Boolean(account.has_api_connection) ||
+    account.sync_status === "SYNCED" ||
+    account.sync_status === "SYNCING" ||
+    account.sync_status === "ERROR" ||
+    transactions.some((t: any) => API_TRANSACTION_SOURCES.has(t.source));
+  const canSyncApi = !isDemo && Boolean(account.has_api_connection);
+  const apiProvider = String(account.api_provider || account.institution_name || account.name || "").toUpperCase();
+  const supportsRecentSync = apiProvider.includes("KRAKEN");
+  const canAddManual = !isDemo && !isApiManaged;
+  const manualTxnType = manualForm.transaction_type;
+  const isIncomeRow = ["DIVIDEND", "DISTRIBUTION", "INTEREST"].includes(manualTxnType);
+  const isBuySellRow = ["BUY", "SELL"].includes(manualTxnType);
+  const quantityLabel = isIncomeRow ? "Units held" : "Qty";
+  const priceLabel = isIncomeRow ? "Payout/unit" : "Price";
+  const amountPlaceholder = isIncomeRow || isBuySellRow ? "Auto" : "Optional";
+  const manualHelpText = isIncomeRow
+    ? "For ETF distributions/dividends: enter one row per symbol and payment/ex-date. Units held × payout/unit − tax/fees becomes the positive income amount."
+    : "BUY/SELL amounts are calculated from quantity × price ± fees if Amount is blank. Dashboard and Analytics refresh after save.";
+  const payoutProjections: PayoutProjection[] = Object.values(
+    transactions
+      .filter((txn: any) => ["DIVIDEND", "DISTRIBUTION"].includes(txn.transaction_type) && txn.symbol && txn.net_amount)
+      .reduce((acc: Record<string, any[]>, txn: any) => {
+        const symbol = txn.symbol;
+        if (!acc[symbol]) acc[symbol] = [];
+        acc[symbol].push(txn);
+        return acc;
+      }, {})
+  )
+    .map((rows: any[]) => {
+      const sorted = [...rows].sort(
+        (a, b) => new Date(a.transacted_at).getTime() - new Date(b.transacted_at).getTime()
+      );
+      const latest = sorted[sorted.length - 1];
+      const dates = sorted.map((txn) => toDateInput(txn.transacted_at));
+      const cadence = inferCadenceMonths(dates);
+      return {
+        symbol: latest.symbol,
+        transaction_type: latest.transaction_type,
+        next_date: addMonths(toDateInput(latest.transacted_at), cadence),
+        cadence_months: cadence,
+        quantity: latest.quantity ?? null,
+        price_per_unit: latest.price_per_unit ?? null,
+        net_amount: latest.net_amount,
+        currency: latest.currency || account.currency || "AUD",
+      };
+    })
+    .sort((a, b) => a.next_date.localeCompare(b.next_date) || a.symbol.localeCompare(b.symbol));
 
   const totalInvested = transactions
     .filter((t) => t.transaction_type === "BUY")
     .reduce((sum: number, t: any) => sum + Math.abs(t.net_amount ?? 0), 0);
+
+  const setManualField = (field: keyof ManualTransactionForm, value: string) => {
+    setManualForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const parseOptionalNumber = (value: string) => {
+    const trimmed = value.trim();
+    return trimmed === "" ? undefined : Number(trimmed);
+  };
+
+  const createManualMutation = useMutation({
+    mutationFn: () => {
+      const txnType = manualForm.transaction_type;
+      const requiresAsset = ASSET_REQUIRED_TYPES.has(txnType);
+      const assetSymbol = manualForm.asset_symbol.trim().toUpperCase();
+      if (requiresAsset && !assetSymbol) {
+        throw new Error("Asset symbol is required for this transaction type.");
+      }
+      if (!manualForm.transacted_at) {
+        throw new Error("Transaction date is required.");
+      }
+
+      return api.post("/transactions/", {
+        account_id: account.id,
+        asset_symbol: assetSymbol || undefined,
+        transaction_type: txnType,
+        quantity: parseOptionalNumber(manualForm.quantity),
+        price_per_unit: parseOptionalNumber(manualForm.price_per_unit),
+        fees: parseOptionalNumber(manualForm.fees) ?? 0,
+        net_amount: parseOptionalNumber(manualForm.net_amount),
+        currency: manualForm.currency.trim().toUpperCase() || account.currency || "AUD",
+        transacted_at: new Date(`${manualForm.transacted_at}T12:00:00`).toISOString(),
+        notes: manualForm.notes.trim() || undefined,
+      }).then((r) => r.data);
+    },
+    onSuccess: async () => {
+      toast.success("Transaction added");
+      setManualForm(initialManualForm(account.currency || "AUD"));
+      setShowManualForm(false);
+      await queryClient.invalidateQueries({ queryKey: ["transactions"] });
+      await queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+      await queryClient.invalidateQueries({ queryKey: ["analytics"] });
+    },
+    onError: (error: any) => {
+      const detail = error?.response?.data?.detail ?? error?.message ?? "Failed to add transaction";
+      toast.error(detail);
+    },
+  });
+
+  const deleteTransactionMutation = useMutation({
+    mutationFn: (transactionId: string) => api.delete(`/transactions/${transactionId}`),
+    onSuccess: async () => {
+      toast.success("Transaction deleted");
+      await queryClient.invalidateQueries({ queryKey: ["transactions"] });
+      await queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+      await queryClient.invalidateQueries({ queryKey: ["analytics"] });
+    },
+    onError: (error: any) => {
+      toast.error(error?.response?.data?.detail ?? "Failed to delete transaction");
+    },
+  });
+
+  const syncAccountMutation = useMutation({
+    mutationFn: () =>
+      apiSlow
+        .post(`/sync/accounts/${account.id}/trigger${supportsRecentSync ? "?recent=true" : ""}`)
+        .then((response) => response.data),
+    onSuccess: async (result) => {
+      if (result?.error) {
+        toast.error(`Sync error: ${result.error}`);
+        return;
+      }
+      const syncScope = result?.mode === "recent" ? "recent " : "";
+      toast.success(`Imported ${result?.imported ?? 0} ${syncScope}transaction${result?.imported === 1 ? "" : "s"}`);
+      await queryClient.invalidateQueries({ queryKey: ["transactions"] });
+      await queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+      await queryClient.invalidateQueries({ queryKey: ["analytics"] });
+    },
+    onError: (error: any) => {
+      toast.error(error?.response?.data?.detail ?? "Sync failed");
+    },
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["portfolio", "accounts", "all"] });
+    },
+  });
+
+  const handleDeleteTransaction = (txn: any) => {
+    const label = `${txn.transaction_type} ${txn.symbol || ""}`.trim();
+    if (confirm(`Delete this transaction row?\n\n${label} · ${formatDate(txn.transacted_at)}\n\nDashboard and Analytics will be recalculated after deletion.`)) {
+      deleteTransactionMutation.mutate(txn.id);
+    }
+  };
+
+  const usePayoutProjection = (projection: PayoutProjection) => {
+    setManualForm({
+      transacted_at: projection.next_date,
+      transaction_type: projection.transaction_type,
+      asset_symbol: projection.symbol,
+      quantity: projection.quantity != null ? String(projection.quantity) : "",
+      price_per_unit: projection.price_per_unit != null ? String(projection.price_per_unit) : "",
+      fees: "0",
+      net_amount: String(projection.net_amount),
+      currency: projection.currency,
+      notes: `Projected ${projection.transaction_type.toLowerCase()} based on prior ${projection.symbol} payout; review before saving.`,
+    });
+    setShowManualForm(true);
+  };
 
   return (
     <div className={clsx(
@@ -747,6 +1042,46 @@ function AccountCard({
           )}>
             {isActive ? "Active" : "Excluded"}
           </span>
+          {isApiManaged && (
+            <span
+              className="text-xs px-2 py-0.5 rounded-full font-medium text-amber-400 bg-amber-400/10"
+              title="Transactions for API-connected accounts are managed by provider sync."
+            >
+              API read-only
+            </span>
+          )}
+          {canSyncApi && (
+            <button
+              onClick={() => syncAccountMutation.mutate()}
+              disabled={syncAccountMutation.isPending || account.sync_status === "SYNCING"}
+              className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg text-blue-400 bg-blue-400/10 hover:bg-blue-400/20 transition-colors disabled:opacity-50 disabled:cursor-wait"
+              title={supportsRecentSync ? "Fetch recent transactions for this API account" : "Fetch transactions for this API account"}
+            >
+              {syncAccountMutation.isPending || account.sync_status === "SYNCING" ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <RefreshCw className="w-3 h-3" />
+              )}
+              {syncAccountMutation.isPending || account.sync_status === "SYNCING"
+                ? "Syncing..."
+                : supportsRecentSync
+                ? "Sync recent"
+                : "Sync account"}
+            </button>
+          )}
+          {canAddManual && (
+            <button
+              onClick={() => {
+                setExpanded(true);
+                setShowManualForm((s) => !s);
+              }}
+              className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg text-blue-400 bg-blue-400/10 hover:bg-blue-400/20 transition-colors"
+              title="Add a manual transaction to this CSV/manual portfolio"
+            >
+              <Plus className="w-3 h-3" />
+              Add row
+            </button>
+          )}
           <button
             onClick={() => onRemove(account.id, account.name)}
             className="text-gray-600 hover:text-red-400 transition-colors p-1 rounded hover:bg-red-400/10"
@@ -756,6 +1091,162 @@ function AccountCard({
           </button>
         </div>
       </div>
+
+      {expanded && isApiManaged && (
+        <div className="px-4 py-2 text-xs text-amber-300 bg-amber-400/5 border-b border-amber-400/10">
+          This portfolio is API-connected. Transactions are read-only here so provider sync remains the source of truth.
+        </div>
+      )}
+
+      {expanded && showManualForm && canAddManual && (
+        <div className="p-4 border-b border-gray-800 bg-gray-900/30">
+          <div className="grid grid-cols-2 md:grid-cols-5 xl:grid-cols-10 gap-2">
+            <div>
+              <label className="block text-[10px] text-gray-500 uppercase mb-1">Date</label>
+              <input
+                type="date"
+                value={manualForm.transacted_at}
+                onChange={(e) => setManualField("transacted_at", e.target.value)}
+                className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-200"
+              />
+            </div>
+            <div>
+              <label className="block text-[10px] text-gray-500 uppercase mb-1">Type</label>
+              <select
+                value={manualForm.transaction_type}
+                onChange={(e) => setManualField("transaction_type", e.target.value)}
+                className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-200"
+              >
+                {MANUAL_TRANSACTION_TYPES.map((type) => (
+                  <option key={type} value={type}>{TYPE_LABELS[type] ?? type}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-[10px] text-gray-500 uppercase mb-1">Asset</label>
+              <input
+                value={manualForm.asset_symbol}
+                onChange={(e) => setManualField("asset_symbol", e.target.value.toUpperCase())}
+                placeholder={ASSET_REQUIRED_TYPES.has(manualForm.transaction_type) ? "Required" : "Optional"}
+                className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 font-mono"
+              />
+            </div>
+            <div>
+              <label className="block text-[10px] text-gray-500 uppercase mb-1">{quantityLabel}</label>
+              <input
+                type="number"
+                step="any"
+                value={manualForm.quantity}
+                onChange={(e) => setManualField("quantity", e.target.value)}
+                placeholder="0"
+                className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 font-mono"
+              />
+            </div>
+            <div>
+              <label className="block text-[10px] text-gray-500 uppercase mb-1">{priceLabel}</label>
+              <input
+                type="number"
+                step="any"
+                value={manualForm.price_per_unit}
+                onChange={(e) => setManualField("price_per_unit", e.target.value)}
+                placeholder={isIncomeRow ? "e.g. 0.125" : "Auto if blank"}
+                className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 font-mono"
+              />
+            </div>
+            <div>
+              <label className="block text-[10px] text-gray-500 uppercase mb-1">Fees</label>
+              <input
+                type="number"
+                step="any"
+                value={manualForm.fees}
+                onChange={(e) => setManualField("fees", e.target.value)}
+                placeholder="0"
+                className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 font-mono"
+              />
+            </div>
+            <div>
+              <label className="block text-[10px] text-gray-500 uppercase mb-1">Amount</label>
+              <input
+                type="number"
+                step="any"
+                value={manualForm.net_amount}
+                onChange={(e) => setManualField("net_amount", e.target.value)}
+                placeholder={amountPlaceholder}
+                className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 font-mono"
+              />
+            </div>
+            <div>
+              <label className="block text-[10px] text-gray-500 uppercase mb-1">CCY</label>
+              <input
+                value={manualForm.currency}
+                onChange={(e) => setManualField("currency", e.target.value.toUpperCase())}
+                className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-200 font-mono"
+                maxLength={5}
+              />
+            </div>
+            <div className="col-span-2">
+              <label className="block text-[10px] text-gray-500 uppercase mb-1">Notes</label>
+              <input
+                value={manualForm.notes}
+                onChange={(e) => setManualField("notes", e.target.value)}
+                placeholder="Optional"
+                className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600"
+              />
+            </div>
+          </div>
+          <div className="flex items-center justify-between gap-3 mt-3">
+            <p className="text-xs text-gray-500">
+              {manualHelpText}
+            </p>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowManualForm(false)}
+                className="px-3 py-1.5 text-xs rounded-lg text-gray-400 hover:text-gray-200 border border-gray-700 hover:bg-gray-800 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => createManualMutation.mutate()}
+                disabled={createManualMutation.isPending}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-blue-600 text-white hover:bg-blue-500 disabled:opacity-50 transition-colors"
+              >
+                {createManualMutation.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
+                Save transaction
+              </button>
+            </div>
+          </div>
+          {payoutProjections.length > 0 && (
+            <div className="mt-3 rounded-lg border border-blue-500/20 bg-blue-500/5 p-3">
+              <div className="mb-2 text-xs font-medium text-blue-300">
+                Project next payout from previous rows
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {payoutProjections.map((projection) => (
+                  <button
+                    key={`${projection.symbol}-${projection.next_date}`}
+                    type="button"
+                    onClick={() => usePayoutProjection(projection)}
+                    className="rounded-lg border border-gray-700 bg-gray-900/60 px-2.5 py-1.5 text-left text-xs text-gray-300 hover:border-blue-500/50 hover:bg-blue-500/10 transition-colors"
+                    title="Prefill the form. You can edit all fields before saving."
+                  >
+                    <span className="font-semibold text-gray-100">{projection.symbol}</span>
+                    <span className="mx-1 text-gray-500">·</span>
+                    <span>{projection.next_date}</span>
+                    <span className="mx-1 text-gray-500">·</span>
+                    <span>{formatCurrency(projection.net_amount, false, projection.currency)}</span>
+                    <span className="ml-1 text-gray-500">({projection.cadence_months}m)</span>
+                  </button>
+                ))}
+              </div>
+              <p className="mt-2 text-[11px] text-gray-500">
+                These are editable projections based on the latest saved payout and inferred cadence. Saving is manual.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Transactions Table */}
       {expanded && txCount > 0 && (
@@ -771,6 +1262,7 @@ function AccountCard({
                 <th className="text-right p-2.5">Fees</th>
                 <th className="text-right p-2.5">Amount</th>
                 <th className="text-center p-2.5 pr-4">CCY</th>
+                {canAddManual && <th className="text-right p-2.5 pr-4">Action</th>}
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-800/30">
@@ -822,6 +1314,19 @@ function AccountCard({
                         {ccy}
                       </span>
                     </td>
+                    {canAddManual && (
+                      <td className="p-2.5 pr-4 text-right">
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteTransaction(txn)}
+                          disabled={deleteTransactionMutation.isPending}
+                          className="inline-flex items-center justify-center rounded p-1 text-gray-600 hover:text-red-400 hover:bg-red-400/10 disabled:opacity-50 transition-colors"
+                          title="Delete this transaction row"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </td>
+                    )}
                   </tr>
                 );
               })}
@@ -832,7 +1337,9 @@ function AccountCard({
 
       {expanded && txCount === 0 && (
         <div className="p-6 text-center text-gray-500 text-sm">
-          No transactions yet. Import a CSV file to populate this account.
+          {canAddManual
+            ? "No transactions yet. Import a CSV file or add a manual row to populate this account."
+            : "No transactions yet. Sync this API-connected account from its provider."}
         </div>
       )}
     </div>
@@ -881,6 +1388,11 @@ export default function TransactionsPage() {
       api.patch(`/portfolio/accounts/${id}`, { is_active }).then((r) => r.data),
     onSuccess: (data) => {
       toast.success(data.is_active ? `${data.name} included in dashboard` : `${data.name} excluded from dashboard`);
+      queryClient.setQueryData<any[]>(["portfolio", "accounts", "all"], (old) =>
+        old?.map((account) => (account.id === data.id ? { ...account, ...data } : account)) ?? old
+      );
+      queryClient.invalidateQueries({ queryKey: ["portfolio", "accounts", "all"] });
+      queryClient.invalidateQueries({ queryKey: ["portfolio", "accounts"] });
       queryClient.invalidateQueries({ queryKey: ["portfolio"] });
       queryClient.invalidateQueries({ queryKey: ["analytics"] });
     },
@@ -957,6 +1469,7 @@ export default function TransactionsPage() {
 
       await queryClient.invalidateQueries({ queryKey: ["portfolio"] });
       await queryClient.invalidateQueries({ queryKey: ["transactions"] });
+      await queryClient.invalidateQueries({ queryKey: ["analytics"] });
 
       const msg = totalImported > 0
         ? `Demo portfolio loaded — ${totalImported} transactions imported${totalDuplicates ? ` (${totalDuplicates} already present)` : ""}`
@@ -1140,6 +1653,7 @@ export default function TransactionsPage() {
                     setSelectedBroker(null);
                     queryClient.invalidateQueries({ queryKey: ["transactions"] });
                     queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+                    queryClient.invalidateQueries({ queryKey: ["analytics"] });
                   }}
                 />
               ) : (
@@ -1151,6 +1665,7 @@ export default function TransactionsPage() {
                     setSelectedBroker(null);
                     queryClient.invalidateQueries({ queryKey: ["transactions"] });
                     queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+                    queryClient.invalidateQueries({ queryKey: ["analytics"] });
                   }}
                 />
               )}

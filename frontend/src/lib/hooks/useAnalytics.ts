@@ -47,12 +47,27 @@ export interface AnalyticsBundle {
   benchmark: string;
 }
 
-export function useAnalytics(period: string = "1Y", benchmark: string = "SPY", currency: string = "AUD") {
-  const ccyParam = currency && currency !== "AUD" ? `&currency=${currency}` : "";
+export function useAnalytics(
+  period: string = "1Y",
+  benchmark: string = "SPY",
+  currency: string = "AUD",
+  startDate?: string,
+  endDate?: string,
+) {
+  const params = new URLSearchParams();
+  params.set("period", period);
+  params.set("benchmark", benchmark);
+  if (currency && currency !== "AUD") params.set("currency", currency);
+  if (startDate && endDate) {
+    params.set("start_date", startDate);
+    params.set("end_date", endDate);
+  }
+
   return useQuery<AnalyticsBundle>({
-    queryKey: ["analytics", period, benchmark, currency],
+    queryKey: ["analytics", period, benchmark, currency, startDate, endDate],
     queryFn: () =>
-      api.get(`/analytics/?period=${period}&benchmark=${benchmark}${ccyParam}`).then((r) => r.data),
+      api.get(`/analytics/?${params.toString()}`).then((r) => r.data),
     staleTime: 5 * 60 * 1000,
+    enabled: period !== "CUSTOM" || Boolean(startDate && endDate),
   });
 }

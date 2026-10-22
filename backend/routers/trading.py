@@ -11,16 +11,17 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
-from sqlalchemy import select, delete
+from pydantic import BaseModel, Field
+from sqlalchemy import select, delete, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
-from shared.models import User, WatchlistItem, AnalysisResult
+from shared.models import User, WatchlistItem, AnalysisResult, SignalCheck
 from shared.auth import get_current_user
 from services.market_data_service import MarketDataService
 from services.trading_analysis_service import run_trading_analysis
@@ -54,6 +55,17 @@ class AnalyzeRequest(BaseModel):
     provider: Literal["claude", "openai", "gemini", "ollama", "lmstudio"] = "gemini"
     extra_context: Optional[str] = None
     as_of_date: Optional[str] = None  # ISO date "YYYY-MM-DD" — analyze up to this date
+
+
+class SignalRequest(BaseModel):
+    symbol: str
+    name: Optional[str] = None
+    asset_class: str          # EQUITY | CRYPTO | ETF
+    interval: Literal["15", "60", "240", "D", "W"] = "D"
+    exchange: Optional[str] = None
+    currency: str = "USD"
+    as_of_date: Optional[str] = None
+    evaluation_days: int = Field(default=7, ge=1, le=90)
 
 
 # ─── Markets ──────────────────────────────────────────────────────────────────
@@ -593,6 +605,466 @@ async def analyze_asset(
         logger.warning("Failed to persist analysis result: %s", exc)
 
     return result
+
+
+@router.post("/signal")
+async def generate_signal(
+    req: SignalRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Generate a deterministic technical signal for the selected chart timeframe.
+
+    This endpoint does not call any LLM provider and is separate from /analyze.
+    """
+    from datetime import datetime, timezone, timedelta
+    from services.signal_engine import SignalEngine
+
+    sym = req.symbol.upper()
+    end = datetime.now(timezone.utc)
+    if req.as_of_date:
+        try:
+            end = datetime.strptime(req.as_of_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            end = end + timedelta(days=1)
+            if end > datetime.now(timezone.utc):
+                end = datetime.now(timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="as_of_date must be YYYY-MM-DD")
+
+    start = end - _signal_lookback(req.interval)
+    future_candles: list[dict] = []
+    now = datetime.now(timezone.utc)
+    eval_start = end
+    due_at = end + timedelta(days=req.evaluation_days)
+    can_evaluate = due_at <= now
+    eval_end = due_at if can_evaluate else now
+
+    svc = MarketDataService()
+    try:
+        candles = await svc.get_chart_ohlcv(
+            symbol=sym,
+            interval=req.interval,
+            start_date=start,
+            end_date=end,
+            asset_class=req.asset_class,
+            currency=req.currency,
+            exchange=req.exchange,
+        )
+        if req.as_of_date and can_evaluate:
+            future_candles = await svc.get_chart_ohlcv(
+                symbol=sym,
+                interval=req.interval,
+                start_date=eval_start,
+                end_date=eval_end,
+                asset_class=req.asset_class,
+                currency=req.currency,
+                exchange=req.exchange,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.warning("Signal OHLCV fetch failed for %s: %s", sym, exc)
+        raise HTTPException(status_code=502, detail="Could not fetch chart candles for signal analysis")
+    finally:
+        await svc.close()
+
+    if not candles or len(candles) < 30:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Not enough candles for {sym} on {req.interval} timeframe. Need at least 30.",
+        )
+
+    try:
+        result = SignalEngine(candles, req.interval).analyze()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Signal engine failed for %s", sym)
+        raise HTTPException(status_code=500, detail="Signal engine failed")
+
+    result["symbol"] = sym
+    result["name"] = req.name or sym
+    result["assetClass"] = req.asset_class
+    result["_as_of_date"] = req.as_of_date
+    result["requestedEvaluationDays"] = req.evaluation_days
+    result["dueAt"] = due_at.isoformat()
+    result["status"] = "EVALUATED" if req.as_of_date and can_evaluate else "PENDING"
+    result["backtest"] = _evaluate_signal_outcome(result, future_candles, eval_start, eval_end) if req.as_of_date and can_evaluate else None
+
+    try:
+        record = await _persist_signal_check(
+            db=db,
+            user_id=current_user.id,
+            req=req,
+            result=result,
+            signal_at=end,
+            due_at=due_at,
+        )
+        result["_signal_id"] = record.id
+    except Exception as exc:
+        logger.warning("Failed to persist signal check: %s", exc)
+    return result
+
+
+def _signal_lookback(interval: str):
+    from datetime import timedelta
+
+    return {
+        "15": timedelta(days=30),
+        "60": timedelta(days=90),
+        "240": timedelta(days=180),
+        "D": timedelta(days=420),
+        "W": timedelta(days=365 * 4),
+    }[interval]
+
+
+@router.get("/signal-checks")
+async def get_signal_checks(
+    status: Optional[Literal["PENDING", "EVALUATED"]] = Query(None),
+    symbol: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List saved deterministic signal checks for the current user."""
+    q = select(SignalCheck).where(SignalCheck.user_id == current_user.id)
+    if status:
+        q = q.where(SignalCheck.status == status)
+    if symbol:
+        q = q.where(SignalCheck.symbol == symbol.upper())
+    q = q.order_by(desc(SignalCheck.created_at)).limit(limit)
+    rows = (await db.execute(q)).scalars().all()
+    return {"items": [_signal_check_to_dict(row) for row in rows]}
+
+
+@router.post("/signal-checks/check-due")
+async def check_due_signal_checks(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Evaluate all due pending signal checks for the current user."""
+    now = datetime.now(timezone.utc)
+    rows = (
+        await db.execute(
+            select(SignalCheck)
+            .where(SignalCheck.user_id == current_user.id)
+            .where(SignalCheck.status == "PENDING")
+            .where(SignalCheck.due_at <= now)
+            .order_by(SignalCheck.due_at)
+            .limit(50)
+        )
+    ).scalars().all()
+
+    checked = []
+    for row in rows:
+        checked.append(await _check_signal_record(row, db))
+    return {"checked": len(checked), "items": checked}
+
+
+@router.post("/signal-checks/{signal_id}/check")
+async def check_signal_check(
+    signal_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Evaluate one due signal check."""
+    row = await db.get(SignalCheck, signal_id)
+    if not row or row.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Signal check not found")
+    return await _check_signal_record(row, db)
+
+
+async def _persist_signal_check(
+    db: AsyncSession,
+    user_id: str,
+    req: SignalRequest,
+    result: dict,
+    signal_at,
+    due_at,
+) -> SignalCheck:
+    from decimal import Decimal
+
+    plan = result.get("tradePlan", {})
+    backtest = result.get("backtest")
+    record = SignalCheck(
+        user_id=user_id,
+        symbol=req.symbol.upper(),
+        name=req.name or req.symbol.upper(),
+        asset_class=req.asset_class,
+        exchange=req.exchange,
+        currency=req.currency,
+        interval=req.interval,
+        signal=result.get("signal", "HOLD"),
+        score=result.get("score"),
+        confidence=result.get("confidence"),
+        action=plan.get("action"),
+        signal_at=signal_at,
+        due_at=due_at,
+        evaluation_days=req.evaluation_days,
+        status="EVALUATED" if backtest else "PENDING",
+        current_price=_decimal_or_none(result.get("currentPrice")),
+        entry_price=_decimal_or_none(plan.get("entry")),
+        entry_zone_low=_decimal_or_none(plan.get("entryZoneLow")),
+        entry_zone_high=_decimal_or_none(plan.get("entryZoneHigh")),
+        stop_loss=_decimal_or_none(plan.get("stopLoss")),
+        take_profit_1=_decimal_or_none(plan.get("takeProfit1")),
+        take_profit_2=_decimal_or_none(plan.get("takeProfit2")),
+        take_profit_3=_decimal_or_none(plan.get("takeProfit3")),
+        risk_reward=_decimal_or_none(plan.get("riskReward")),
+        payload=result,
+    )
+    if backtest:
+        record.outcome = backtest.get("outcome")
+        record.outcome_payload = backtest
+        record.outcome_correct = _is_successful_outcome(backtest)
+        record.outcome_return_pct = _decimal_or_none(backtest.get("returnPct"))
+        record.checked_at = datetime.now(timezone.utc)
+
+    db.add(record)
+    await db.commit()
+    await db.refresh(record)
+    return record
+
+
+async def _check_signal_record(row: SignalCheck, db: AsyncSession) -> dict:
+    now = datetime.now(timezone.utc)
+    if row.status == "EVALUATED":
+        return _signal_check_to_dict(row)
+    if row.due_at > now:
+        item = _signal_check_to_dict(row)
+        item["checkMessage"] = f"Not due until {row.due_at.isoformat()}"
+        return item
+
+    svc = MarketDataService()
+    try:
+        future_candles = await svc.get_chart_ohlcv(
+            symbol=row.symbol,
+            interval=row.interval,
+            start_date=row.signal_at,
+            end_date=row.due_at,
+            asset_class=row.asset_class,
+            currency=row.currency,
+            exchange=row.exchange,
+        )
+    finally:
+        await svc.close()
+
+    payload = row.payload or {}
+    outcome = _evaluate_signal_outcome(payload, future_candles, row.signal_at, row.due_at)
+    row.status = "EVALUATED"
+    row.outcome = outcome.get("outcome")
+    row.outcome_payload = outcome
+    row.outcome_correct = _is_successful_outcome(outcome)
+    row.outcome_return_pct = _decimal_or_none(outcome.get("returnPct"))
+    row.checked_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(row)
+    return _signal_check_to_dict(row)
+
+
+def _signal_check_to_dict(row: SignalCheck) -> dict:
+    return {
+        "id": row.id,
+        "symbol": row.symbol,
+        "name": row.name,
+        "assetClass": row.asset_class,
+        "exchange": row.exchange,
+        "interval": row.interval,
+        "signal": row.signal,
+        "score": row.score,
+        "confidence": row.confidence,
+        "action": row.action,
+        "status": row.status,
+        "signalAt": row.signal_at.isoformat(),
+        "dueAt": row.due_at.isoformat(),
+        "evaluationDays": row.evaluation_days,
+        "currentPrice": _float_or_none(row.current_price),
+        "entryPrice": _float_or_none(row.entry_price),
+        "stopLoss": _float_or_none(row.stop_loss),
+        "takeProfit1": _float_or_none(row.take_profit_1),
+        "takeProfit2": _float_or_none(row.take_profit_2),
+        "takeProfit3": _float_or_none(row.take_profit_3),
+        "riskReward": _float_or_none(row.risk_reward),
+        "outcome": row.outcome,
+        "outcomeCorrect": row.outcome_correct,
+        "outcomeReturnPct": _float_or_none(row.outcome_return_pct),
+        "outcomePayload": row.outcome_payload,
+        "checkedAt": row.checked_at.isoformat() if row.checked_at else None,
+        "createdAt": row.created_at.isoformat(),
+    }
+
+
+def _is_successful_outcome(outcome: dict | None) -> bool | None:
+    if not outcome or not outcome.get("available"):
+        return None
+    value = outcome.get("outcome")
+    if value == "ENTRY_NOT_TRIGGERED":
+        return True
+    if value and value.startswith("TAKE_PROFIT"):
+        return True
+    if value == "STOP_LOSS_HIT":
+        return False
+    return None
+
+
+def _decimal_or_none(value):
+    from decimal import Decimal
+
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _float_or_none(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _evaluate_signal_outcome(signal_result: dict, future_candles: list[dict], eval_start, eval_end) -> dict:
+    """Evaluate whether the generated execution plan would have triggered and how it performed."""
+    plan = signal_result.get("tradePlan", {})
+    direction = "long" if signal_result.get("signal") in {"BUY", "STRONG BUY"} else "short" if signal_result.get("signal") in {"SELL", "STRONG SELL"} else "neutral"
+    window = {
+        "from": eval_start.isoformat(),
+        "to": eval_end.isoformat(),
+        "days": max((eval_end - eval_start).days, 0),
+    }
+    if not future_candles:
+        return {
+            "available": False,
+            "evaluationWindow": window,
+            "summary": "No future candles were available for this historical evaluation window.",
+        }
+    if direction == "neutral":
+        final_price = _last_close(future_candles)
+        start_price = signal_result.get("currentPrice")
+        return {
+            "available": True,
+            "evaluationWindow": window,
+            "entryTriggered": False,
+            "outcome": "NO_TRADE_HOLD_SIGNAL",
+            "finalPrice": final_price,
+            "finalMovePct": _pct(final_price, start_price),
+            "summary": "Signal was HOLD, so no entry was evaluated. Final move is shown for context.",
+        }
+
+    entry = float(plan["entry"])
+    zone_low = float(plan["entryZoneLow"])
+    zone_high = float(plan["entryZoneHigh"])
+    stop = float(plan["stopLoss"])
+    targets = [float(plan["takeProfit1"]), float(plan["takeProfit2"]), float(plan["takeProfit3"])]
+    action = plan.get("action", "")
+
+    triggered_at = None
+    for idx, candle in enumerate(future_candles):
+        high = float(candle.get("high") or candle.get("close"))
+        low = float(candle.get("low") or candle.get("close"))
+        if _entry_triggered(direction, action, high, low, entry, zone_low, zone_high):
+            triggered_at = idx
+            break
+
+    final_price = _last_close(future_candles)
+    if triggered_at is None:
+        return {
+            "available": True,
+            "evaluationWindow": window,
+            "entryTriggered": False,
+            "outcome": "ENTRY_NOT_TRIGGERED",
+            "finalPrice": final_price,
+            "finalMovePct": _pct(final_price, signal_result.get("currentPrice")),
+            "summary": "The setup did not trigger during the evaluation window, so no trade would have been opened.",
+        }
+
+    max_target_hit = 0
+    exit_price = final_price
+    exit_date = future_candles[-1].get("date")
+    outcome = "OPEN_AT_WINDOW_END"
+
+    for candle in future_candles[triggered_at:]:
+        high = float(candle.get("high") or candle.get("close"))
+        low = float(candle.get("low") or candle.get("close"))
+        date = candle.get("date")
+        if direction == "long":
+            # Conservative candle sequencing: if stop and target are both inside one candle, stop wins.
+            if low <= stop:
+                outcome = "STOP_LOSS_HIT"
+                exit_price = stop
+                exit_date = date
+                break
+            for target_num, target in reversed(list(enumerate(targets, start=1))):
+                if high >= target:
+                    max_target_hit = max(max_target_hit, target_num)
+                    outcome = f"TAKE_PROFIT_{target_num}_HIT"
+                    exit_price = target
+                    exit_date = date
+                    break
+            if outcome.startswith("TAKE_PROFIT"):
+                break
+        else:
+            if high >= stop:
+                outcome = "STOP_LOSS_HIT"
+                exit_price = stop
+                exit_date = date
+                break
+            for target_num, target in reversed(list(enumerate(targets, start=1))):
+                if low <= target:
+                    max_target_hit = max(max_target_hit, target_num)
+                    outcome = f"TAKE_PROFIT_{target_num}_HIT"
+                    exit_price = target
+                    exit_date = date
+                    break
+            if outcome.startswith("TAKE_PROFIT"):
+                break
+
+    return_pct = _pct(exit_price, entry) if direction == "long" else _pct(entry, exit_price)
+    return {
+        "available": True,
+        "evaluationWindow": window,
+        "entryTriggered": True,
+        "entryDate": future_candles[triggered_at].get("date"),
+        "entryPrice": entry,
+        "exitDate": exit_date,
+        "exitPrice": exit_price,
+        "outcome": outcome,
+        "maxTargetHit": max_target_hit,
+        "returnPct": return_pct,
+        "finalPrice": final_price,
+        "finalMovePct": _pct(final_price, signal_result.get("currentPrice")),
+        "summary": f"Entry triggered, then outcome was {outcome.replace('_', ' ').lower()} over the evaluation window.",
+    }
+
+
+def _entry_triggered(direction: str, action: str, high: float, low: float, entry: float, zone_low: float, zone_high: float) -> bool:
+    if action == "ENTER_NOW":
+        return True
+    if direction == "long":
+        if action == "WAIT_FOR_BREAKOUT":
+            return high >= entry
+        return low <= zone_high and high >= zone_low
+    if action == "WAIT_FOR_BREAKDOWN":
+        return low <= entry
+    return high >= zone_low and low <= zone_high
+
+
+def _last_close(candles: list[dict]) -> float | None:
+    try:
+        return float(candles[-1].get("close"))
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _pct(end: float | None, start: float | None) -> float | None:
+    if not end or not start:
+        return None
+    return round((end / start - 1) * 100, 2)
 
 
 async def _fetch_technical_context(symbol: str, as_of: Optional[datetime] = None) -> str:

@@ -16,11 +16,11 @@ InvestIQ helps you track investments across brokers and exchanges, convert mixed
 
 ## Features
 
-- Import transactions from CommSec, Interactive Brokers, Kraken, Stake, CMC, MooMoo, and similar broker CSV exports.
+- Import transactions from Betashares Direct, CommSec, Interactive Brokers, Kraken, Stake, CMC, MooMoo, and similar broker CSV exports.
 - Track equities, ETFs, and crypto across multiple accounts.
 - Toggle AUD/USD reporting with per-transaction FX handling.
 - Review holdings, cost basis, unrealized P&L, dividends, staking income, and realized gains.
-- Analyze performance, allocation, risk, drawdowns, and benchmark comparison.
+- Review performance, allocation, risk, drawdowns, and benchmark comparison from the main dashboard.
 - Use AI analysis and a portfolio advisor with Gemini, Claude, OpenAI, Ollama, or LM Studio.
 - Run locally with Docker Compose, PostgreSQL, Redis, FastAPI, and Next.js.
 
@@ -32,7 +32,7 @@ A quick visual tour of InvestIQ and the main workflows it brings together.
   <img src="docs/screenshots/dashboard.png" alt="InvestIQ dashboard" width="900">
 </p>
 
-| Transactions | Analytics |
+| Transactions | Dashboard Analytics |
 |---|---|
 | <img src="docs/screenshots/transactions.png" alt="Transaction import and holdings view" width="440"> | <img src="docs/screenshots/analytics.png" alt="Portfolio analytics view" width="440"> |
 
@@ -52,21 +52,23 @@ Prerequisites: Docker and Docker Compose.
 git clone https://github.com/miladtm94/Investment-Portfolio-Tracker
 cd Investment-Portfolio-Tracker
 cp .env.example .env
-docker compose up -d
+make serve
 ```
 
 Open the app at [http://localhost:3000](http://localhost:3000).
 
-The backend runs on [http://localhost:8010](http://localhost:8010) by default to avoid common local port conflicts.
+The root `.env` is the single source for Docker and Makefile workflows. The backend runs on [http://localhost:8010](http://localhost:8010) by default to avoid common local port conflicts.
 
 Useful commands:
 
 ```bash
 make serve         # start existing containers
+make restart       # restart backend and frontend containers
 make rebuild       # rebuild with Docker cache
 make clean-rebuild # full no-cache rebuild
 make logs          # follow container logs
 make stop          # stop services
+make dev-local     # run backend and frontend locally against Docker Postgres/Redis
 ```
 
 Minimum `.env` values:
@@ -85,6 +87,7 @@ GEMINI_API_KEY=your-key
 
 | Source | Method | Notes |
 |---|---|---|
+| Betashares Direct | Activity CSV | Fractional ASX holdings and named consolidated/Managed/Custom portfolios |
 | CommSec | CSV export | ASX equities and ETFs |
 | Interactive Brokers | Flex Query / CSV | Global assets, dividends, cash transactions |
 | Kraken | Trades CSV / API sync | Crypto, mainly USD quoted |

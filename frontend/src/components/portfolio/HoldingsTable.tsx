@@ -29,6 +29,9 @@ export interface Holding {
   unrealized_gain_pct?: number;
   currency?: string;
   original_currency?: string;
+  exchange?: string | null;
+  period_income?: number | null;
+  period_price_return_pct?: number | null;
 }
 
 interface Props {
@@ -36,6 +39,8 @@ interface Props {
   loading?: boolean;
   currency?: string;
   showTotals?: boolean;
+  showPeriodMetrics?: boolean;
+  periodLabel?: string;
 }
 
 type SortKey =
@@ -47,17 +52,18 @@ type SortKey =
   | "average_cost_basis"
   | "total_cost_basis"
   | "unrealized_gain_pct"
+  | "period_price_return_pct"
+  | "period_income"
   | "weight_pct";
 
 type SortDir = "asc" | "desc";
-
-const COL_COUNT = 9;
 
 const COLUMNS: {
   key: SortKey;
   label: string;
   short?: string;
   align: "left" | "right";
+  periodOnly?: boolean;
 }[] = [
   { key: "symbol", label: "Ticker", align: "left" },
   { key: "last_price", label: "Price", align: "right" },
@@ -67,6 +73,8 @@ const COLUMNS: {
   { key: "average_cost_basis", label: "Avg Cost", align: "right" },
   { key: "total_cost_basis", label: "Cost Basis", short: "Cost", align: "right" },
   { key: "unrealized_gain_pct", label: "Return %", short: "Return", align: "right" },
+  { key: "period_price_return_pct", label: "Period Price", short: "Period", align: "right", periodOnly: true },
+  { key: "period_income", label: "Period Income", short: "Income", align: "right", periodOnly: true },
   { key: "weight_pct", label: "Weight", align: "right" },
 ];
 
@@ -80,14 +88,30 @@ const fmtDate = (iso: string) =>
 const fmtQty = (q: number) =>
   q < 1 ? q.toFixed(6) : q % 1 === 0 ? q.toFixed(0) : q.toFixed(2);
 
+function marketLabel(holding: Holding): string {
+  const exchange = holding.exchange?.trim().toUpperCase();
+  if (exchange) return exchange;
+  if (holding.asset_class === "CRYPTO") return "Crypto";
+  const symbol = holding.symbol.toUpperCase();
+  if (symbol.endsWith(".AX") || holding.original_currency === "AUD") return "ASX";
+  if (holding.original_currency === "USD") return "US";
+  return holding.original_currency || "Market";
+}
+
+function marketBadgeClass(label: string) {
+  if (label === "ASX") return "bg-blue-500/10 text-blue-400";
+  if (label === "Crypto") return "bg-orange-500/10 text-orange-400";
+  return "bg-green-500/10 text-green-400";
+}
+
 // ─── Expandable sub-row for a single holding ──────────────────────────────
-function ExpandedDetail({ symbol, origCcy }: { symbol: string; origCcy: string }) {
+function ExpandedDetail({ symbol, origCcy, colSpan }: { symbol: string; origCcy: string; colSpan: number }) {
   const { data: txns, isLoading } = useHoldingTransactions(symbol);
 
   if (isLoading) {
     return (
       <tr>
-        <td colSpan={COL_COUNT} className="py-4 text-center">
+        <td colSpan={colSpan} className="py-4 text-center">
           <Loader2 className="w-4 h-4 animate-spin inline-block text-gray-500 mr-2" />
           <span className="text-gray-500 text-xs">Loading transactions...</span>
         </td>
@@ -110,7 +134,7 @@ function ExpandedDetail({ symbol, origCcy }: { symbol: string; origCcy: string }
   if (trades.length === 0) {
     return (
       <tr>
-        <td colSpan={COL_COUNT} className="py-3 text-center text-gray-600 text-xs">
+        <td colSpan={colSpan} className="py-3 text-center text-gray-600 text-xs">
           No transaction history found.
         </td>
       </tr>
@@ -119,7 +143,7 @@ function ExpandedDetail({ symbol, origCcy }: { symbol: string; origCcy: string }
 
   return (
     <tr>
-      <td colSpan={COL_COUNT} className="p-0">
+      <td colSpan={colSpan} className="p-0">
         <div className="bg-gray-900/60 border-y border-gray-800/60 px-4 py-3">
           <h4 className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">
             Trades & Adjustments
@@ -195,6 +219,8 @@ export function HoldingsTable({
   loading = false,
   currency = "AUD",
   showTotals = true,
+  showPeriodMetrics = false,
+  periodLabel = "period",
 }: Props) {
   const [sortKey, setSortKey] = useState<SortKey>("market_value");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
@@ -213,15 +239,29 @@ export function HoldingsTable({
     setExpandedSymbol((prev) => (prev === symbol ? null : symbol));
   };
 
-  // Filter out tiny holdings (< $1 market value) but keep stablecoins
   const STABLECOINS = new Set(["USDT", "USDC", "DAI", "BUSD"]);
   const filtered = useMemo(() => {
     return holdings.filter((h) => {
       if (STABLECOINS.has(h.symbol.toUpperCase())) return true;
-      const mv = Math.abs(h.market_value ?? 0);
-      return mv >= 1;
+      const marketValue = Math.abs(h.market_value ?? 0);
+      const costBasis = Math.abs(h.total_cost_basis ?? 0);
+      const quantity = Math.abs(h.quantity ?? 0);
+      return marketValue >= 1 || costBasis >= 1 || quantity > 0;
     });
   }, [holdings]);
+
+  const showPeriodPriceReturn =
+    showPeriodMetrics && filtered.some((h) => h.period_price_return_pct != null);
+
+  const visibleColumns = useMemo(
+    () =>
+      COLUMNS.filter((col) => {
+        if (!col.periodOnly) return true;
+        if (col.key === "period_price_return_pct") return showPeriodPriceReturn;
+        return showPeriodMetrics;
+      }),
+    [showPeriodMetrics, showPeriodPriceReturn]
+  );
 
   const sorted = useMemo(() => {
     return [...filtered].sort((a, b) => {
@@ -245,8 +285,16 @@ export function HoldingsTable({
     const totalValue = filtered.reduce((s, h) => s + (h.market_value ?? 0), 0);
     const totalCost = filtered.reduce((s, h) => s + (h.total_cost_basis ?? 0), 0);
     const totalGain = filtered.reduce((s, h) => s + (h.unrealized_gain ?? 0), 0);
+    const totalPeriodIncome = filtered.reduce((s, h) => s + (h.period_income ?? 0), 0);
+    const weightedPeriodReturn =
+      totalValue > 0
+        ? filtered.reduce(
+            (s, h) => s + ((h.period_price_return_pct ?? 0) * (h.market_value ?? 0)) / totalValue,
+            0
+          )
+        : 0;
     const totalReturnPct = totalCost > 0 ? (totalGain / totalCost) * 100 : 0;
-    return { totalValue, totalCost, totalGain, totalReturnPct };
+    return { totalValue, totalCost, totalGain, totalReturnPct, totalPeriodIncome, weightedPeriodReturn };
   }, [filtered, showTotals]);
 
   const isToggled = currency !== "AUD";
@@ -288,7 +336,7 @@ export function HoldingsTable({
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-gray-800">
-            {COLUMNS.map((col) => (
+            {visibleColumns.map((col) => (
               <th
                 key={col.key}
                 onClick={() => handleSort(col.key)}
@@ -301,6 +349,9 @@ export function HoldingsTable({
                   {col.align === "right" && <SortIcon col={col.key} />}
                   <span className="hidden lg:inline">{col.label}</span>
                   <span className="lg:hidden">{col.short || col.label}</span>
+                  {col.periodOnly && (
+                    <span className="hidden xl:inline normal-case text-gray-600">({periodLabel})</span>
+                  )}
                   {col.align === "left" && <SortIcon col={col.key} />}
                 </span>
               </th>
@@ -317,6 +368,7 @@ export function HoldingsTable({
                 : 0);
             const returnPositive = returnPct >= 0;
             const origCcy = h.original_currency || "AUD";
+            const market = marketLabel(h);
             const isExpanded = expandedSymbol === h.symbol;
 
             return (
@@ -340,19 +392,9 @@ export function HoldingsTable({
                         )}
                       />
                       <span className="font-semibold text-gray-100">{h.symbol}</span>
-                      {/* Show currency badge for equities only — crypto doesn't need USD/AUD tag */}
-                      {h.asset_class !== "CRYPTO" && (
-                        <span
-                          className={clsx(
-                            "text-[9px] px-1 py-0.5 rounded font-medium",
-                            origCcy === "USD"
-                              ? "bg-green-500/10 text-green-400"
-                              : "bg-blue-500/10 text-blue-400"
-                          )}
-                        >
-                          {origCcy}
-                        </span>
-                      )}
+                      <span className={clsx("text-[9px] px-1 py-0.5 rounded font-medium", marketBadgeClass(market))}>
+                        {market}
+                      </span>
                       {h.name && h.name !== h.symbol && (
                         <span className="text-[10px] text-gray-500 truncate max-w-[100px] hidden lg:inline">
                           {h.name}
@@ -418,6 +460,38 @@ export function HoldingsTable({
                     </span>
                   </td>
 
+                  {showPeriodPriceReturn && (
+                    <td className="py-3 pr-3 text-right">
+                      {h.period_price_return_pct != null ? (
+                        <span
+                          className={clsx(
+                            "font-mono text-xs font-medium px-1.5 py-0.5 rounded",
+                            h.period_price_return_pct >= 0
+                              ? "text-green-400 bg-green-400/10"
+                              : "text-red-400 bg-red-400/10"
+                          )}
+                        >
+                          {h.period_price_return_pct >= 0 ? "+" : ""}
+                          {h.period_price_return_pct.toFixed(1)}%
+                        </span>
+                      ) : (
+                        <span className="text-gray-600">—</span>
+                      )}
+                    </td>
+                  )}
+
+                  {showPeriodMetrics && (
+                    <td className="py-3 pr-3 text-right">
+                      {h.period_income != null && h.period_income !== 0 ? (
+                        <span className="font-mono font-medium text-green-400">
+                          +{fmtMoney(h.period_income)}
+                        </span>
+                      ) : (
+                        <span className="text-gray-600">—</span>
+                      )}
+                    </td>
+                  )}
+
                   {/* Weight */}
                   <td className="py-3 text-right">
                     {h.weight_pct != null ? (
@@ -444,6 +518,7 @@ export function HoldingsTable({
                     key={`${h.symbol}-detail`}
                     symbol={h.symbol}
                     origCcy={origCcy}
+                    colSpan={visibleColumns.length}
                   />
                 )}
               </Fragment>
@@ -506,6 +581,29 @@ export function HoldingsTable({
                   {totals.totalReturnPct.toFixed(1)}%
                 </span>
               </td>
+              {showPeriodPriceReturn && (
+                <td className="py-3 pr-3 text-right">
+                  <span
+                    className={clsx(
+                      "font-mono text-xs font-bold px-1.5 py-0.5 rounded",
+                      totals.weightedPeriodReturn >= 0
+                        ? "text-green-400 bg-green-400/10"
+                        : "text-red-400 bg-red-400/10"
+                    )}
+                  >
+                    {totals.weightedPeriodReturn >= 0 ? "+" : ""}
+                    {totals.weightedPeriodReturn.toFixed(1)}%
+                  </span>
+                </td>
+              )}
+              {showPeriodMetrics && (
+                <td className="py-3 pr-3 text-right">
+                  <span className="font-mono font-bold text-green-400">
+                    {totals.totalPeriodIncome > 0 ? "+" : ""}
+                    {formatCurrency(totals.totalPeriodIncome, false, currency)}
+                  </span>
+                </td>
+              )}
               <td className="py-3 text-right text-gray-400 text-xs">100%</td>
             </tr>
           </tfoot>

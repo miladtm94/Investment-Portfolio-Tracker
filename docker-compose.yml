@@ -57,6 +57,8 @@ services:
       ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-dev-encryption-key-32bytes-here!}
+      FRONTEND_PORT: ${FRONTEND_PORT:-3000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
     volumes:
       - ./backend:/app
     ports:
@@ -142,7 +144,7 @@ services:
 
 volumes:
   postgres_data:
-    external: true
+    # Fixed name so data survives project renames; created on first `up` if missing
     name: investment-platform_postgres_data
   redis_data:
 

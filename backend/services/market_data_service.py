@@ -35,6 +35,14 @@ class MarketDataService:
         "DOT", "AVAX", "EIGEN", "BABY", "DOGE", "UNI", "AAVE", "ATOM", "LTC",
     }
 
+    _YAHOO_INTERVALS = {
+        "15": "15m",
+        "60": "60m",
+        "240": "60m",  # fetched hourly, resampled to 4h locally
+        "D": "1d",
+        "W": "1wk",
+    }
+
     def __init__(self):
         self._http = httpx.AsyncClient(timeout=15.0, limits=httpx.Limits(max_connections=100))
         self._asx_symbols: set[str] = set()  # Track symbols that need .AX suffix
@@ -135,6 +143,49 @@ class MarketDataService:
 
         return prices
 
+    async def get_chart_ohlcv(
+        self,
+        symbol: str,
+        interval: str,
+        start_date: datetime,
+        end_date: datetime,
+        asset_class: Optional[str] = None,
+        currency: str = "USD",
+        exchange: Optional[str] = None,
+    ) -> list[dict]:
+        """
+        Get OHLCV candles for chart/signal analysis.
+
+        interval accepts TradingView-style values used by the frontend:
+        "15", "60", "240", "D", "W".
+        """
+        interval = interval.upper()
+        if interval not in self._YAHOO_INTERVALS:
+            raise ValueError(f"Unsupported interval: {interval}")
+
+        cache_suffix = f":{exchange or currency or ''}:{asset_class or ''}"
+        cache_key = (
+            f"market:chart:{symbol}:{interval}{cache_suffix}:"
+            f"{int(start_date.timestamp())}:{int(end_date.timestamp())}"
+        )
+        cached = await cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        rows = await self._yahoo_chart_history(
+            symbol=symbol,
+            interval=interval,
+            start=start_date,
+            end=end_date,
+            asset_class=asset_class,
+            currency=currency,
+            exchange=exchange,
+        )
+
+        if rows:
+            await cache_set(cache_key, rows, ttl=300 if interval in {"15", "60", "240"} else 3600)
+        return rows
+
     async def get_price_at_date(self, symbol: str, date: datetime) -> Optional[float]:
         """Get the closing price for a symbol on a specific date."""
         cache_key = f"market:price:{symbol}:{date.date()}:close"
@@ -188,7 +239,7 @@ class MarketDataService:
             return None
 
         url = f"https://api.polygon.io/v2/last/trade/{symbol}"
-        resp = await self._http.get(url, params={"apiKey": api_key})
+        resp = await self._http.get(url, headers={"Authorization": f"Bearer {api_key}"})
         resp.raise_for_status()
         data = resp.json()
         return float(data["results"]["p"])  # price
@@ -224,7 +275,9 @@ class MarketDataService:
         """Fetch OHLCV from Polygon or Yahoo."""
         if currency.upper() != "AUD":
             try:
-                return await self._polygon_history(symbol, start, end)
+                prices = await self._polygon_history(symbol, start, end)
+                if prices:
+                    return prices
             except Exception:
                 pass
         try:
@@ -238,7 +291,7 @@ class MarketDataService:
             return []
 
         url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
-        resp = await self._http.get(url, params={"apiKey": api_key, "adjusted": "true"})
+        resp = await self._http.get(url, params={"adjusted": "true"}, headers={"Authorization": f"Bearer {api_key}"})
         resp.raise_for_status()
         data = resp.json()
 
@@ -288,6 +341,104 @@ class MarketDataService:
                 logger.debug(f"Yahoo history {symbol}{suffix}: {e}")
                 continue
         return []
+
+    async def _yahoo_chart_history(
+        self,
+        symbol: str,
+        interval: str,
+        start: datetime,
+        end: datetime,
+        asset_class: Optional[str] = None,
+        currency: str = "USD",
+        exchange: Optional[str] = None,
+    ) -> list[dict]:
+        """Fetch timeframe-aware OHLCV from Yahoo Finance chart API."""
+        import pandas as pd
+
+        yahoo_interval = self._YAHOO_INTERVALS[interval]
+        yf_symbols = self._yahoo_symbol_candidates(symbol, asset_class, currency, exchange)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        params = {
+            "interval": yahoo_interval,
+            "period1": int(start.timestamp()),
+            "period2": int(end.timestamp()),
+            "includePrePost": "false",
+        }
+
+        for yf_symbol in yf_symbols:
+            try:
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_symbol}"
+                resp = await self._http.get(url, headers=headers, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                result = data["chart"]["result"][0]
+                timestamps = result.get("timestamp") or []
+                quotes = result.get("indicators", {}).get("quote", [{}])[0]
+                rows = [
+                    {
+                        "date": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                        "open": quotes.get("open", [None])[i],
+                        "high": quotes.get("high", [None])[i],
+                        "low": quotes.get("low", [None])[i],
+                        "close": quotes.get("close", [None])[i],
+                        "volume": quotes.get("volume", [None])[i] or 0,
+                    }
+                    for i, ts in enumerate(timestamps)
+                    if quotes.get("close", [None])[i] is not None
+                ]
+                if not rows:
+                    continue
+
+                if interval == "240":
+                    df = pd.DataFrame(rows)
+                    df["date"] = pd.to_datetime(df["date"], utc=True)
+                    df = (
+                        df.set_index("date")
+                        .resample("4h", label="right", closed="right")
+                        .agg({
+                            "open": "first",
+                            "high": "max",
+                            "low": "min",
+                            "close": "last",
+                            "volume": "sum",
+                        })
+                        .dropna(subset=["close"])
+                    )
+                    rows = [
+                        {
+                            "date": idx.isoformat(),
+                            "open": row["open"],
+                            "high": row["high"],
+                            "low": row["low"],
+                            "close": row["close"],
+                            "volume": row["volume"],
+                        }
+                        for idx, row in df.iterrows()
+                    ]
+
+                if yf_symbol.endswith(".AX"):
+                    self._asx_symbols.add(symbol)
+                return rows
+            except Exception as e:
+                logger.debug("Yahoo chart history %s %s failed: %s", yf_symbol, interval, e)
+                continue
+        return []
+
+    def _yahoo_symbol_candidates(
+        self,
+        symbol: str,
+        asset_class: Optional[str] = None,
+        currency: str = "USD",
+        exchange: Optional[str] = None,
+    ) -> list[str]:
+        sym = symbol.upper()
+        if asset_class == "CRYPTO" or self._is_crypto(sym):
+            return [f"{sym}-USD", sym]
+        if sym.endswith(".AX"):
+            return [sym, sym.removesuffix(".AX")]
+        if (exchange and "ASX" in exchange.upper()) or currency.upper() == "AUD":
+            return [f"{sym}.AX", sym]
+        return [sym, f"{sym}.AX"]
 
     # ─── Crypto Providers ────────────────────────────────────────────────
 

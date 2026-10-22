@@ -16,6 +16,9 @@ export interface Holding {
   unrealized_gain_pct?: number;
   currency: string;
   original_currency?: string;
+  exchange?: string | null;
+  period_income?: number | null;
+  period_price_return_pct?: number | null;
 }
 
 export interface PortfolioSummary {
@@ -25,23 +28,50 @@ export interface PortfolioSummary {
   total_unrealized_gain_pct: number;
   total_realized_gain_short: number;
   total_realized_gain_long: number;
+  total_realized_gain: number;
+  total_income: number;
+  total_pnl: number;
+  total_pnl_pct: number;
   dividend_income: number;
   staking_income: number;
   holdings: Holding[];
   as_of: string;
+  period?: string | null;
+  period_start?: string | null;
+  period_end?: string | null;
+  period_market_value_change?: number | null;
+  period_realized_gain_short?: number | null;
+  period_realized_gain_long?: number | null;
+  period_realized_gain?: number | null;
+  period_income?: number | null;
+  period_pnl?: number | null;
+  period_pnl_pct?: number | null;
 }
 
-export function usePortfolioSummary(accountIds?: string[], currency: string = "AUD") {
+export function usePortfolioSummary(
+  accountIds?: string[],
+  currency: string = "AUD",
+  period?: string,
+  startDate?: string,
+  endDate?: string,
+) {
   const searchParams = new URLSearchParams();
   accountIds?.forEach((id) => searchParams.append("account_ids", id));
   if (currency && currency !== "AUD") searchParams.set("currency", currency);
+  if (period) searchParams.set("period", period);
+  if (startDate && endDate) {
+    searchParams.set("start_date", startDate);
+    searchParams.set("end_date", endDate);
+  }
   const qs = searchParams.toString();
   const url = `/portfolio/summary${qs ? `?${qs}` : ""}`;
   return useQuery<PortfolioSummary>({
-    queryKey: ["portfolio", "summary", accountIds, currency],
+    queryKey: ["portfolio", "summary", accountIds, currency, period, startDate, endDate],
     queryFn: () => api.get(url).then((r) => r.data),
+    placeholderData: (previousData) => previousData,
     staleTime: 30 * 1000,
     refetchInterval: 60 * 1000,
+    enabled: period !== "CUSTOM" || Boolean(startDate && endDate),
   });
 }
 

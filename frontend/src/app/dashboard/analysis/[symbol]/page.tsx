@@ -6,12 +6,14 @@ import {
   ArrowLeft, TrendingUp, TrendingDown, BarChart2, Newspaper,
   ShieldAlert, Star, LayoutTemplate, Target, Brain, Globe,
   Activity, Clock, CheckCircle2, XCircle, Calendar, ChevronRight,
-  ArrowUpRight, ArrowDownRight, Minus,
+  ArrowUpRight, ArrowDownRight, Minus, Zap, AlertTriangle,
 } from "lucide-react";
 import {
   useAnalyzeAsset, useAddToWatchlist, useWatchlist,
   useRemoveFromWatchlist, useOllamaStatus, useLMStudioStatus,
+  useGenerateSignal,
   type Provider, type Horizon, type AnalysisResult, type AssetClass,
+  type SignalResult,
 } from "@/lib/hooks/useTrading";
 import { formatCurrency } from "@/lib/utils/formatters";
 import TradingViewChart, { INTERVALS, type TVInterval } from "@/components/charts/TradingViewChart";
@@ -123,6 +125,24 @@ function PriceTag({ label, value, sub, accent }: { label: string; value?: number
   );
 }
 
+function SignalPill({ signal }: { signal: SignalResult["signal"] }) {
+  const cfg = REC_CONFIG[signal] ?? REC_CONFIG.HOLD;
+  return (
+    <span className={clsx("inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-bold border", cfg.bg, cfg.text, cfg.border)}>
+      {cfg.icon} {signal}
+    </span>
+  );
+}
+
+function IndicatorChip({ label, value }: { label: string; value?: number | null }) {
+  return (
+    <div className="rounded-lg border border-gray-800 bg-gray-950/40 px-3 py-2 min-w-0">
+      <div className="text-[10px] text-gray-600 uppercase tracking-wider truncate">{label}</div>
+      <div className="font-mono text-xs text-gray-300 mt-1">{value == null ? "—" : value}</div>
+    </div>
+  );
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export default function AnalysisPage() {
@@ -140,9 +160,12 @@ export default function AnalysisPage() {
   const [provider, setProvider] = useState<Provider>("gemini");
   const [interval, setInterval] = useState<TVInterval>("D");
   const [result, setResult]     = useState<AnalysisResult | null>(null);
+  const [signalResult, setSignalResult] = useState<SignalResult | null>(null);
   const [asOfDate, setAsOfDate] = useState<string>("");   // "" = now, "YYYY-MM-DD" = historical
+  const [evaluationDays, setEvaluationDays] = useState<number>(7);
 
   const analyze      = useAnalyzeAsset();
+  const signal       = useGenerateSignal();
   const { data: ollamaStatus }   = useOllamaStatus();
   const { data: lmStudioStatus } = useLMStudioStatus();
   const { data: watchlist = [] } = useWatchlist();
@@ -161,6 +184,24 @@ export default function AnalysisPage() {
         as_of_date: asOfDate || null,
       },
       { onSuccess: (data) => setResult(data) }
+    );
+  };
+
+  const handleSignal = () => {
+    const signalInterval = (
+      ["15", "60", "240", "D", "W"].includes(interval) ? interval : "15"
+    ) as "15" | "60" | "240" | "D" | "W";
+    signal.mutate(
+      {
+        symbol,
+        name,
+        asset_class: assetClass,
+        exchange,
+        interval: signalInterval,
+        as_of_date: asOfDate || null,
+        evaluation_days: evaluationDays,
+      },
+      { onSuccess: (data) => setSignalResult(data) }
     );
   };
 
@@ -231,6 +272,270 @@ export default function AnalysisPage() {
           </div>
         </div>
         <TradingViewChart symbol={symbol} assetClass={assetClass} exchange={exchange} interval={interval} height={500} />
+      </div>
+
+      {/* ── Technical Signal Engine ── */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+        <div className="flex items-center justify-between gap-4 flex-wrap mb-5">
+          <div className="flex items-center gap-2">
+            <Zap className="w-4 h-4 text-blue-400" />
+            <h2 className="text-sm font-semibold text-gray-200 uppercase tracking-widest">Technical Signal Engine</h2>
+            <span className="text-xs text-gray-600">· deterministic · {INTERVALS.find((i) => i.value === interval)?.label ?? interval} candles</span>
+          </div>
+          <div className="flex items-end gap-3 flex-wrap">
+            <div className="flex flex-col gap-1">
+              <label className="text-[10px] text-gray-600 uppercase tracking-wider">Signal Date</label>
+              <input
+                type="date"
+                value={asOfDate}
+                max={today}
+                onChange={(e) => setAsOfDate(e.target.value)}
+                className="bg-gray-800 border border-gray-700 text-xs text-gray-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-blue-500"
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[10px] text-gray-600 uppercase tracking-wider">Check After</label>
+              <select
+                value={evaluationDays}
+                onChange={(e) => setEvaluationDays(Number(e.target.value))}
+                className="bg-gray-800 border border-gray-700 text-xs text-gray-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-blue-500"
+              >
+                <option value={3}>3 days</option>
+                <option value={7}>1 week</option>
+                <option value={14}>2 weeks</option>
+                <option value={30}>1 month</option>
+              </select>
+            </div>
+            {asOfDate && (
+              <button onClick={() => setAsOfDate("")}
+                className="text-xs text-gray-500 hover:text-gray-300 border border-gray-700 rounded-lg px-2.5 py-1.5">
+                Now
+              </button>
+            )}
+            <button onClick={handleSignal} disabled={signal.isPending}
+              className="px-5 py-2 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg text-sm transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-2">
+              {signal.isPending ? (
+                <>
+                  <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  Calculating…
+                </>
+              ) : (
+                <>{signalResult ? "Recalculate Signal" : "Generate Signal"}</>
+              )}
+            </button>
+          </div>
+        </div>
+
+        {signal.isError && (
+          <div className="mb-4 flex items-start gap-2 text-sm text-red-400 bg-red-400/5 border border-red-400/20 rounded-lg px-4 py-3">
+            <ShieldAlert className="w-4 h-4 flex-shrink-0 mt-0.5" />
+            {(signal.error as Error)?.message ?? "Signal calculation failed."}
+          </div>
+        )}
+
+        {!signalResult && !signal.isPending ? (
+          <div className="text-sm text-gray-500 border border-dashed border-gray-800 rounded-lg px-4 py-5">
+            Generate a rule-based signal from the selected chart timeframe. Pick a past signal date to backtest against later candles.
+          </div>
+        ) : signalResult ? (
+          <div className="space-y-5">
+            <div className="flex items-start gap-5 flex-wrap">
+              <ScoreRing score={signalResult.score} />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-3 flex-wrap mb-3">
+                  <SignalPill signal={signalResult.signal} />
+                  <span className="text-sm text-gray-400">
+                    Confidence: <span className={clsx("font-semibold", signalResult.confidence === "High" ? "text-emerald-400" : signalResult.confidence === "Low" ? "text-red-400" : "text-amber-400")}>
+                      {signalResult.confidence}
+                    </span>
+                  </span>
+                  <span className="text-xs px-2 py-0.5 rounded border bg-gray-800/60 text-gray-400 border-gray-700">
+                    {signalResult.candleCount} candles · last {signalResult.lastCandleTime.slice(0, 16)}
+                  </span>
+                  {signalResult._signal_id && (
+                    <span className={clsx("text-xs px-2 py-0.5 rounded border",
+                      signalResult.status === "EVALUATED"
+                        ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                        : "bg-amber-500/10 text-amber-400 border-amber-500/20"
+                    )}>
+                      {signalResult.status === "EVALUATED" ? "Checked" : `Will check ${new Date(signalResult.dueAt).toLocaleDateString("en-AU")}`}
+                    </span>
+                  )}
+                </div>
+                <p className="text-sm text-gray-300 leading-relaxed">{signalResult.explanation}</p>
+                <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                  <div className="rounded border border-gray-800 bg-gray-950/30 px-3 py-2">
+                    <span className="text-gray-600">Analysis window</span>
+                    <div className="text-gray-300 font-mono mt-0.5">
+                      {signalResult.analysisWindow.from.slice(0, 10)} → {signalResult.analysisWindow.to.slice(0, 10)}
+                    </div>
+                  </div>
+                  <div className="rounded border border-gray-800 bg-gray-950/30 px-3 py-2">
+                    <span className="text-gray-600">Timeframe</span>
+                    <div className="text-gray-300 mt-0.5">{INTERVALS.find((i) => i.value === signalResult.timeframe)?.label ?? signalResult.timeframe}</div>
+                  </div>
+                  <div className="rounded border border-gray-800 bg-gray-950/30 px-3 py-2">
+                    <span className="text-gray-600">Score meaning</span>
+                    <div className="text-gray-300 mt-0.5">{signalResult.scoreMeaning}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+              <div className={clsx("rounded-lg p-3 border",
+                signalResult.tradePlan.isActionableNow
+                  ? "bg-emerald-950/30 border-emerald-800/40"
+                  : "bg-amber-950/20 border-amber-800/40"
+              )}>
+                <div className="text-xs text-gray-500 mb-1">Action</div>
+                <div className={clsx("text-sm font-semibold",
+                  signalResult.tradePlan.isActionableNow ? "text-emerald-400" : "text-amber-400"
+                )}>
+                  {signalResult.tradePlan.action.replaceAll("_", " ")}
+                </div>
+                <div className="text-[10px] text-gray-600 mt-0.5">{signalResult.tradePlan.setup}</div>
+              </div>
+              <PriceTag label="Planned Entry" value={signalResult.tradePlan.entry} sub={`${formatCurrency(signalResult.tradePlan.entryZoneLow, false, "USD")} - ${formatCurrency(signalResult.tradePlan.entryZoneHigh, false, "USD")}`}
+                accent="bg-blue-950/30 border-blue-800/40" />
+              <PriceTag label="Stop Loss" value={signalResult.tradePlan.stopLoss}
+                accent="bg-red-950/30 border-red-800/40" />
+              <PriceTag label="Take Profit 1" value={signalResult.tradePlan.takeProfit1}
+                accent="bg-emerald-950/20 border-emerald-900/30" />
+              <PriceTag label="Take Profit 2" value={signalResult.tradePlan.takeProfit2}
+                accent="bg-emerald-950/40 border-emerald-700/40" />
+              <PriceTag label="Take Profit 3" value={signalResult.tradePlan.takeProfit3}
+                accent="bg-emerald-950/60 border-emerald-600/50" />
+              <div className="rounded-lg p-3 border bg-gray-800/40 border-gray-700/50">
+                <div className="text-xs text-gray-500 mb-1">R/R Ratio</div>
+                <div className="font-mono text-sm font-semibold text-gray-100">
+                  {signalResult.tradePlan.riskReward ? `${signalResult.tradePlan.riskReward.toFixed(2)}:1` : "—"}
+                </div>
+                <div className="text-[10px] text-gray-600 mt-0.5">{signalResult.tradePlan.setup}</div>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-gray-800 bg-gray-950/30 px-4 py-3">
+              <div className="text-xs text-gray-500 uppercase tracking-wider mb-1">Entry Rule</div>
+              <p className="text-sm text-gray-300">{signalResult.tradePlan.entryCondition}</p>
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2">
+              <IndicatorChip label="RSI 14" value={signalResult.indicators.rsi14} />
+              <IndicatorChip label="MACD Hist" value={signalResult.indicators.macdHistogram} />
+              <IndicatorChip label="ATR 14" value={signalResult.indicators.atr14} />
+              <IndicatorChip label="Volume" value={signalResult.indicators.volumeRatio} />
+              <IndicatorChip label="EMA 9" value={signalResult.indicators.ema9} />
+              <IndicatorChip label="EMA 21" value={signalResult.indicators.ema21} />
+              <IndicatorChip label="Stoch K" value={signalResult.indicators.stochasticK} />
+              <IndicatorChip label="Stoch D" value={signalResult.indicators.stochasticD} />
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <div className="text-xs text-gray-500 uppercase tracking-wider">Why this signal</div>
+                <div className="space-y-2">
+                  {signalResult.evidence.map((item) => (
+                    <div key={item.label} className="flex items-start gap-3 rounded-lg border border-gray-800 bg-gray-950/30 px-3 py-2.5">
+                      <span className={clsx("mt-1 text-[10px] font-bold px-1.5 py-0.5 rounded border",
+                        item.verdict === "Bullish" ? "text-emerald-400 border-emerald-800 bg-emerald-950/30" :
+                        item.verdict === "Bearish" ? "text-red-400 border-red-800 bg-red-950/30" :
+                        "text-gray-400 border-gray-700 bg-gray-800/40"
+                      )}>
+                        {item.score > 0 ? "+" : ""}{item.score}
+                      </span>
+                      <div>
+                        <div className="text-sm font-medium text-gray-300">{item.label} · {item.verdict}</div>
+                        <div className="text-xs text-gray-500 leading-relaxed">{item.explanation}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <div>
+                  <div className="text-xs text-gray-500 uppercase tracking-wider mb-2">Support / Resistance</div>
+                  <div className="flex flex-wrap gap-2 mb-2">
+                    {signalResult.levels.support.map((level, i) => (
+                      <span key={`s-${i}`} className="font-mono text-xs px-2.5 py-1 rounded border bg-emerald-950/20 border-emerald-800/40 text-emerald-400">
+                        S {formatCurrency(level, false, "USD")}
+                      </span>
+                    ))}
+                    {signalResult.levels.resistance.map((level, i) => (
+                      <span key={`r-${i}`} className="font-mono text-xs px-2.5 py-1 rounded border bg-red-950/20 border-red-800/40 text-red-400">
+                        R {formatCurrency(level, false, "USD")}
+                      </span>
+                    ))}
+                  </div>
+                  <p className="text-xs text-gray-500">{signalResult.tradePlan.invalidation}</p>
+                </div>
+
+                {signalResult.backtest && (
+                  <div>
+                    <div className="text-xs text-gray-500 uppercase tracking-wider mb-2">Historical Check</div>
+                    <div className="rounded-lg border border-gray-800 bg-gray-950/30 px-3 py-3">
+                      <div className="flex items-center justify-between gap-3 flex-wrap mb-2">
+                        <span className={clsx("text-xs font-semibold px-2 py-0.5 rounded border",
+                          signalResult.backtest.outcome?.includes("TAKE_PROFIT") ? "text-emerald-400 border-emerald-800 bg-emerald-950/30" :
+                          signalResult.backtest.outcome === "STOP_LOSS_HIT" ? "text-red-400 border-red-800 bg-red-950/30" :
+                          "text-amber-400 border-amber-800 bg-amber-950/20"
+                        )}>
+                          {signalResult.backtest.outcome?.replaceAll("_", " ") ?? "Unavailable"}
+                        </span>
+                        <span className="text-[11px] text-gray-600">
+                          {signalResult.backtest.evaluationWindow.from.slice(0, 10)} → {signalResult.backtest.evaluationWindow.to.slice(0, 10)}
+                        </span>
+                      </div>
+                      <p className="text-xs text-gray-400 leading-relaxed mb-3">{signalResult.backtest.summary}</p>
+                      <div className="grid grid-cols-2 gap-2 text-xs">
+                        <div>
+                          <span className="text-gray-600">Entry</span>
+                          <div className="font-mono text-gray-300">
+                            {signalResult.backtest.entryTriggered ? formatCurrency(signalResult.backtest.entryPrice ?? 0, false, "USD") : "Not triggered"}
+                          </div>
+                        </div>
+                        <div>
+                          <span className="text-gray-600">Result</span>
+                          <div className={clsx("font-mono",
+                            (signalResult.backtest.returnPct ?? 0) > 0 ? "text-emerald-400" :
+                            (signalResult.backtest.returnPct ?? 0) < 0 ? "text-red-400" : "text-gray-300"
+                          )}>
+                            {signalResult.backtest.returnPct == null ? "—" : `${signalResult.backtest.returnPct.toFixed(2)}%`}
+                          </div>
+                        </div>
+                        <div>
+                          <span className="text-gray-600">Final price</span>
+                          <div className="font-mono text-gray-300">
+                            {signalResult.backtest.finalPrice == null ? "—" : formatCurrency(signalResult.backtest.finalPrice, false, "USD")}
+                          </div>
+                        </div>
+                        <div>
+                          <span className="text-gray-600">Move from signal</span>
+                          <div className="font-mono text-gray-300">
+                            {signalResult.backtest.finalMovePct == null ? "—" : `${signalResult.backtest.finalMovePct.toFixed(2)}%`}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div>
+                  <div className="text-xs text-gray-500 uppercase tracking-wider mb-2">Risk Notes</div>
+                  <div className="space-y-2">
+                    {signalResult.warnings.map((warning, i) => (
+                      <div key={i} className="flex items-start gap-2 text-xs text-amber-400/90">
+                        <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                        <span>{warning}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {/* ── Analysis Controls ── */}

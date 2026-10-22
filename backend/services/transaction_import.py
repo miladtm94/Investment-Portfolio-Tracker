@@ -10,6 +10,7 @@ Supported brokers:
   - CMC Invest (ASX)        — AUD trades, "Buy"/"Sell"
   - Stake (US equities)     — USD trades with FX column
   - Moomoo (US equities)    — USD trades with commission
+  - Betashares Direct (AU)  — Activity CSV, including fractional ASX holdings
   - Interactive Brokers      — Flex Query CSV export (wide format)
   - Kraken (crypto)         — "pair" column with txid
   - Coinbase (crypto)       — "Spot Price" column
@@ -33,7 +34,8 @@ import pandas as pd
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from shared.models import Account, Asset, Transaction
+from shared.assets import get_or_create_asset
+from shared.models import Account, Transaction
 from services.fx_service import FXService
 
 logger = logging.getLogger(__name__)
@@ -59,7 +61,13 @@ TYPE_ALIASES = {
     # Interest
     "interest": "INTEREST", "bond interest": "INTEREST", "credit interest": "INTEREST",
     # Transfers
-    "transfer": "TRANSFER_IN", "deposit": "DEPOSIT", "withdrawal": "WITHDRAWAL",
+    "transfer": "TRANSFER_IN", "transfer in": "TRANSFER_IN",
+    "asset transfer in": "TRANSFER_IN", "in specie transfer in": "TRANSFER_IN",
+    "opening balance": "TRANSFER_IN",
+    "transfer out": "TRANSFER_OUT", "asset transfer out": "TRANSFER_OUT",
+    "in specie transfer out": "TRANSFER_OUT",
+    "deposit": "DEPOSIT", "cash deposit": "DEPOSIT",
+    "withdrawal": "WITHDRAWAL", "cash withdrawal": "WITHDRAWAL",
     # Crypto
     "stake_reward": "STAKE_REWARD", "staking": "STAKE_REWARD",
     "airdrop": "AIRDROP", "mining": "MINING_REWARD",
@@ -104,6 +112,28 @@ BROKER_SIGNATURES: list[tuple[set[str], BrokerProfile]] = [
                 "notes": "Security Description",
             },
             date_format="%d/%m/%Y",
+        ),
+    ),
+
+    # Betashares Direct Activity export. The selected-broker hint also uses
+    # this profile so minor header changes do not prevent an import.
+    (
+        {"trade date", "instrument code", "market code", "transaction type", "amount"},
+        BrokerProfile(
+            name="Betashares Direct",
+            default_currency="AUD",
+            column_map={
+                "date": "Trade Date",
+                "type": "Transaction Type",
+                "symbol": "Instrument Code",
+                "quantity": "Quantity",
+                "price": "Price",
+                "fees": "Brokerage",
+                "currency": "Brokerage Currency",
+                "net_amount": "Amount",
+                "notes": "Comments",
+            },
+            date_format=None,
         ),
     ),
 
@@ -356,6 +386,10 @@ class TransactionImporter:
         self.db = db
         self._fx = FXService()
 
+    @staticmethod
+    def _scoped_import_hash(account_id: str, legacy_hash: str) -> str:
+        return hashlib.sha256(f"{account_id}|{legacy_hash}".encode()).hexdigest()
+
     async def import_file(
         self,
         file_content: bytes,
@@ -363,6 +397,7 @@ class TransactionImporter:
         account_id: str,
         user_id: str,
         source: str = "CSV_IMPORT",
+        broker_hint: Optional[str] = None,
     ) -> ImportResult:
         ext = file_name.lower().split(".")[-1]
 
@@ -379,7 +414,7 @@ class TransactionImporter:
             return ImportResult(0, 0, 0, 1, ["No data rows found in file"], [])
 
         # Detect broker from column headers
-        broker = self._detect_broker(rows[0])
+        broker = self._profile_for_hint(broker_hint, rows[0]) or self._detect_broker(rows[0])
         logger.info(f"Detected broker: {broker.name} ({len(rows)} rows)")
 
         # Normalize rows using broker-specific mapping
@@ -401,6 +436,8 @@ class TransactionImporter:
         "security", "brokerage", "commission", "fee", "fees", "currency",
         "consideration", "proceeds", "net", "total", "amount", "units", "shares",
         "asxcode", "tradeprice", "ibcommission", "txid",
+        # Betashares Direct / Sharesight-compatible activity export
+        "instrument code", "market code", "transaction type", "trade date", "comments",
         # CommSec specific
         "reference", "security code", "security description", "net proceeds",
         # CMC specific
@@ -476,6 +513,49 @@ class TransactionImporter:
         return [data]
 
     # ─── Broker Detection ────────────────────────────────────────────────
+
+    _BETASHARES_ALIASES = {
+        "date": ("Trade Date", "Transaction Date", "Activity Date", "Event Date", "Date"),
+        "type": ("Transaction Type", "Activity Type", "Order Type", "Action", "Type"),
+        "symbol": ("Instrument Code", "ASX Code", "Security Code", "Ticker", "Symbol"),
+        "quantity": ("Quantity", "Units", "Unit Quantity", "Number of Units", "Shares"),
+        "price": ("Price", "Unit Price", "Average Price", "Trade Price", "Cost Price"),
+        "fees": ("Brokerage", "Transaction Fee", "Fees", "Fee"),
+        "currency": ("Brokerage Currency", "Currency Code", "Currency"),
+        "net_amount": ("Amount", "Net Amount", "Total Amount", "Value", "Consideration"),
+        "notes": ("Comments", "Description", "Details", "Instrument Name", "Portfolio"),
+    }
+
+    def _profile_for_hint(
+        self,
+        broker_hint: Optional[str],
+        sample_row: dict,
+    ) -> Optional[BrokerProfile]:
+        """Build a tolerant profile when the user selected a known broker."""
+        hint = (broker_hint or "").lower().replace("-", "_").strip()
+        if hint not in {"betashares", "betashares_direct", "betashares direct"}:
+            return None
+
+        actual_keys = [key for key in sample_row if key is not None]
+        lower_to_actual = {str(key).lower().strip(): key for key in actual_keys}
+        mapping: dict[str, str] = {}
+        for canonical, aliases in self._BETASHARES_ALIASES.items():
+            for alias in aliases:
+                actual = lower_to_actual.get(alias.lower())
+                if actual:
+                    mapping[canonical] = actual
+                    break
+
+        # Preserve useful generic matching if Betashares changes a heading.
+        generic = self._build_generic_profile(sample_row)
+        for canonical, actual in generic.column_map.items():
+            mapping.setdefault(canonical, actual)
+
+        return BrokerProfile(
+            name="Betashares Direct",
+            default_currency="AUD",
+            column_map=mapping,
+        )
 
     def _detect_broker(self, sample_row: dict) -> BrokerProfile:
         """Identify broker from column names in the first row."""
@@ -603,7 +683,13 @@ class TransactionImporter:
 
         # ── Type ──
         type_raw = (get("type") or "BUY").lower().strip()
-        txn_type = TYPE_ALIASES.get(type_raw, type_raw.upper())
+        type_key = re.sub(r"[_-]+", " ", type_raw)
+        type_key = re.sub(r"\s+", " ", type_key)
+        txn_type = (
+            TYPE_ALIASES.get(type_raw)
+            or TYPE_ALIASES.get(type_key)
+            or type_key.replace(" ", "_").upper()
+        )
 
         # IBKR: negative quantity = sell
         if broker.quantity_signed and quantity is not None:
@@ -624,7 +710,13 @@ class TransactionImporter:
             symbol = self._clean_kraken_symbol(symbol)
         else:
             # Generic cleanup
-            symbol = symbol.replace("-USD", "").replace("/USD", "").replace(".AX", "")
+            symbol = (
+                symbol.replace("ASX:", "")
+                .replace("-USD", "")
+                .replace("/USD", "")
+                .removesuffix(".ASX")
+                .removesuffix(".AX")
+            )
 
         if not symbol:
             return None
@@ -635,6 +727,11 @@ class TransactionImporter:
         # IBKR reports commission as negative
         fees = abs(fees)
         net_amount = self._parse_decimal(get("net_amount"))
+        if broker.name == "Betashares Direct" and net_amount is not None:
+            if txn_type in {"BUY", "FEE", "WITHDRAWAL"}:
+                net_amount = -abs(net_amount)
+            elif txn_type in {"SELL", "DIVIDEND", "DISTRIBUTION", "INTEREST", "DEPOSIT"}:
+                net_amount = abs(net_amount)
 
         # ── Currency ──
         currency = (get("currency") or broker.default_currency).upper()
@@ -714,10 +811,14 @@ class TransactionImporter:
 
         for parsed in normalized:
             try:
+                # Keep deduplication stable within an account while allowing a
+                # transferred historical parcel to exist in another portfolio.
+                legacy_hash = parsed.import_hash
+                scoped_hash = self._scoped_import_hash(account_id, legacy_hash)
                 existing = await self.db.execute(
                     select(Transaction).where(
-                        Transaction.import_hash == parsed.import_hash,
                         Transaction.account_id == account_id,
+                        Transaction.import_hash.in_([legacy_hash, scoped_hash]),
                     )
                 )
                 if existing.scalar_one_or_none():
@@ -758,7 +859,7 @@ class TransactionImporter:
                     price_per_unit_aud=price_aud,
                     transacted_at=parsed.date,
                     source=source,
-                    import_hash=parsed.import_hash,
+                    import_hash=scoped_hash,
                     notes=parsed.notes,
                     raw_data=parsed.raw_row,
                 )
@@ -785,28 +886,13 @@ class TransactionImporter:
         )
 
     async def _resolve_asset(self, symbol: str, currency: str = "USD") -> Optional[str]:
-        result = await self.db.execute(
-            select(Asset).where(Asset.symbol == symbol)
-        )
-        asset = result.scalar_one_or_none()
-
-        if not asset:
-            CRYPTO_SYMBOLS = {
-                "BTC", "ETH", "SOL", "USDT", "USDC", "BNB", "XRP", "ADA",
-                "MATIC", "LINK", "DOT", "AVAX", "DOGE", "LTC", "UNI", "ATOM",
-                "XLM", "ALGO", "FIL", "AAVE", "NEAR", "OP", "ARB",
-            }
-            asset_class = "CRYPTO" if symbol in CRYPTO_SYMBOLS else "EQUITY"
-
-            asset = Asset(
-                symbol=symbol,
-                name=symbol,
-                asset_class=asset_class,
-                currency=currency,
-            )
-            self.db.add(asset)
-            await self.db.flush()
-
+        CRYPTO_SYMBOLS = {
+            "BTC", "ETH", "SOL", "USDT", "USDC", "BNB", "XRP", "ADA",
+            "MATIC", "LINK", "DOT", "AVAX", "DOGE", "LTC", "UNI", "ATOM",
+            "XLM", "ALGO", "FIL", "AAVE", "NEAR", "OP", "ARB",
+        }
+        asset_class = "CRYPTO" if symbol in CRYPTO_SYMBOLS else "EQUITY"
+        asset = await get_or_create_asset(self.db, symbol, currency, asset_class)
         return asset.id
 
     # ─── Date Parsing ────────────────────────────────────────────────────
@@ -848,7 +934,16 @@ class TransactionImporter:
     def _parse_decimal(value: Optional[str]) -> Optional[Decimal]:
         if not value:
             return None
-        cleaned = value.replace(",", "").replace("$", "").replace("£", "").replace("€", "").strip()
+        cleaned = value.replace(",", "").strip()
+        cleaned = re.sub(r"^(AUD|USD|NZD|GBP|EUR)\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = (
+            cleaned.replace("A$", "")
+            .replace("NZ$", "")
+            .replace("$", "")
+            .replace("£", "")
+            .replace("€", "")
+            .strip()
+        )
         is_negative = cleaned.startswith("(") and cleaned.endswith(")")
         cleaned = cleaned.strip("()")
         # Handle trailing minus (some brokers)

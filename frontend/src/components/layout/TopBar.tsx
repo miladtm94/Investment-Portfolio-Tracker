@@ -6,7 +6,7 @@ import { usePortfolioSummary } from "@/lib/hooks/usePortfolio";
 import { formatCurrency } from "@/lib/utils/formatters";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCurrency } from "@/lib/context/CurrencyContext";
-import { api } from "@/lib/api/client";
+import { apiSlow } from "@/lib/api/client";
 import clsx from "clsx";
 
 type RefreshPhase = "idle" | "syncing" | "fetching" | "done" | "error";
@@ -40,13 +40,12 @@ export function TopBar() {
     setPhase("syncing");
     setStatusMsg("Syncing accounts & prices...");
 
-    let syncData: any = null;
-
+    let syncData: any;
     try {
-      const { data } = await api.post("/sync/refresh-all");
+      const { data } = await apiSlow.post("/sync/refresh-all");
       syncData = data;
     } catch (e: any) {
-      setStatusMsg(e?.response?.data?.detail || "Sync failed");
+      setStatusMsg(e?.response?.data?.detail || "Portfolio refresh failed");
       setPhase("error");
       // Still try to refetch UI data
       queryClient.refetchQueries({ type: "active" });
@@ -57,18 +56,16 @@ export function TopBar() {
       return;
     }
 
-    // Build status message from sync results
     const parts: string[] = [];
     if (syncData.accounts_synced > 0) {
-      parts.push(`${syncData.accounts_synced} account${syncData.accounts_synced > 1 ? "s" : ""} synced`);
+      parts.push(`${syncData.accounts_synced} account${syncData.accounts_synced === 1 ? "" : "s"} synced`);
     }
     if (syncData.total_imported > 0) {
-      parts.push(`${syncData.total_imported} new`);
+      parts.push(`${syncData.total_imported} new transaction${syncData.total_imported === 1 ? "" : "s"}`);
     }
     if (syncData.errors?.length > 0) {
-      parts.push(`${syncData.errors.length} error${syncData.errors.length > 1 ? "s" : ""}`);
+      parts.push(`${syncData.errors.length} sync error${syncData.errors.length === 1 ? "" : "s"}`);
     }
-
     const hasErrors = syncData.errors?.length > 0;
 
     // Move to "fetching" phase — spinner keeps going until all data is refetched
@@ -77,28 +74,17 @@ export function TopBar() {
 
     try {
       await Promise.all([
+        queryClient.refetchQueries({ queryKey: ["transactions"], type: "all" }),
         queryClient.refetchQueries({ queryKey: ["portfolio"], type: "all" }),
         queryClient.refetchQueries({ queryKey: ["analytics"], type: "all" }),
       ]);
 
-      setStatusMsg(
-        parts.length > 0
-          ? parts.join(" · ")
-          : "Prices & FX rates refreshed"
-      );
-      if (hasErrors) {
-        setPhase("error");
-        dismissTimer.current = setTimeout(() => {
-          setPhase("idle");
-          setStatusMsg("");
-        }, 5000);
-      } else {
-        setPhase("done");
-        dismissTimer.current = setTimeout(() => {
-          setPhase("idle");
-          setStatusMsg("");
-        }, 4000);
-      }
+      setStatusMsg(parts.length > 0 ? parts.join(" · ") : "Portfolio refreshed");
+      setPhase(hasErrors ? "error" : "done");
+      dismissTimer.current = setTimeout(() => {
+        setPhase("idle");
+        setStatusMsg("");
+      }, hasErrors ? 5000 : 4000);
     } catch (e) {
       setStatusMsg("Refresh complete (some data failed to update)");
       setPhase("error");
@@ -222,7 +208,7 @@ export function TopBar() {
               ? "bg-blue-600/20 border-blue-500/30 cursor-wait"
               : "bg-gray-800 hover:bg-gray-700 border-gray-700"
           )}
-          title="Sync accounts, refresh prices & FX rates"
+          title="Sync connected accounts, prices & FX rates"
         >
           <RefreshCw className={clsx(
             "w-4 h-4 transition-colors",

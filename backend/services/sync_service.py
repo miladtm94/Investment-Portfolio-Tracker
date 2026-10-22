@@ -23,8 +23,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from config import get_settings
-from shared.models import Account, ApiCredential, Asset, Transaction
+from shared.assets import get_or_create_asset
+from shared.models import Account, ApiCredential, Transaction
 from shared.cache import cache_invalidate_user
+from services.kraken_utils import detect_ledger_conversion_refs
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -39,7 +41,7 @@ class SyncService:
         self.db = db
         self.http = httpx.AsyncClient(timeout=30.0)
 
-    async def sync_account(self, account_id: str, user_id: str) -> dict:
+    async def sync_account(self, account_id: str, user_id: str, recent_only: bool = False) -> dict:
         """Sync a single account and return summary."""
         account_result = await self.db.execute(
             select(Account).where(Account.id == account_id, Account.user_id == user_id)
@@ -66,7 +68,7 @@ class SyncService:
 
             provider = credential.provider.upper()
             if provider == "KRAKEN":
-                result = await KrakenConnector(self.db, self.http).sync(account, credential, user_id)
+                result = await KrakenConnector(self.db, self.http).sync(account, credential, user_id, recent_only=recent_only)
             elif provider == "COINBASE":
                 result = await CoinbaseConnector(self.db, self.http).sync(account, credential, user_id)
             elif provider == "BINANCE":
@@ -103,15 +105,22 @@ class KrakenConnector:
         self.db = db
         self.http = http
 
-    async def sync(self, account: Account, credential: ApiCredential, user_id: str) -> dict:
+    async def sync(
+        self,
+        account: Account,
+        credential: ApiCredential,
+        user_id: str,
+        recent_only: bool = False,
+    ) -> dict:
         api_key = self._decrypt(credential.encrypted_api_key)
         api_secret = self._decrypt(credential.encrypted_api_secret)
 
         imported = 0
         errors = []
+        start_time = self._recent_start_time(account) if recent_only else None
 
         # Fetch trade history — track which base symbol each trade imported
-        trades, trade_err = await self._fetch_trades(api_key, api_secret)
+        trades, trade_err = await self._fetch_trades(api_key, api_secret, start_time=start_time)
         if trade_err:
             errors.append(trade_err)
         # Map trade_id → base symbol imported from /TradesHistory
@@ -125,29 +134,58 @@ class KrakenConnector:
                 imported += 1
 
         # Fetch ledger entries (deposits, withdrawals, staking, trade quote-side)
-        ledger, ledger_err = await self._fetch_ledger(api_key, api_secret)
+        ledger, ledger_err = await self._fetch_ledger(api_key, api_secret, start_time=start_time)
         if ledger_err:
             errors.append(ledger_err)
+        ledger_conversion_refs = self._detect_ledger_conversion_refs(ledger, trade_base_symbols)
         for ledger_id, entry in ledger:
-            txn = await self._normalize_ledger_entry(entry, ledger_id, trade_base_symbols, account.id, user_id)
+            txn = await self._normalize_ledger_entry(
+                entry,
+                ledger_id,
+                trade_base_symbols,
+                ledger_conversion_refs,
+                account.id,
+                user_id,
+            )
             if txn:
                 imported += 1
 
         await self.db.commit()
 
-        result: dict = {"imported": imported, "provider": "kraken"}
+        result: dict = {
+            "imported": imported,
+            "provider": "kraken",
+            "mode": "recent" if start_time else "full",
+        }
         if errors and imported == 0:
             result["error"] = "; ".join(errors)
         return result
 
-    async def _fetch_trades(self, api_key: str, api_secret: str) -> tuple[list[tuple[str, dict]], Optional[str]]:
+    @staticmethod
+    def _recent_start_time(account: Account) -> Optional[datetime]:
+        if not account.last_synced_at:
+            return None
+        last_synced = account.last_synced_at
+        if last_synced.tzinfo is None:
+            last_synced = last_synced.replace(tzinfo=timezone.utc)
+        return last_synced - timedelta(days=7)
+
+    async def _fetch_trades(
+        self,
+        api_key: str,
+        api_secret: str,
+        start_time: Optional[datetime] = None,
+    ) -> tuple[list[tuple[str, dict]], Optional[str]]:
         """Fetch all pages from /TradesHistory. Returns list of (trade_id, trade_data)."""
         try:
             all_trades: list[tuple[str, dict]] = []
             offset = 0
             while True:
+                params = {"ofs": offset}
+                if start_time:
+                    params["start"] = int(start_time.timestamp())
                 data = await self._private_request(
-                    "/0/private/TradesHistory", {"ofs": offset}, api_key, api_secret
+                    "/0/private/TradesHistory", params, api_key, api_secret
                 )
                 trades = data.get("result", {}).get("trades", {})
                 if not trades:
@@ -165,14 +203,22 @@ class KrakenConnector:
             logger.error(f"Kraken trades fetch error: {e}")
             return [], str(e)
 
-    async def _fetch_ledger(self, api_key: str, api_secret: str) -> tuple[list[tuple[str, dict]], Optional[str]]:
+    async def _fetch_ledger(
+        self,
+        api_key: str,
+        api_secret: str,
+        start_time: Optional[datetime] = None,
+    ) -> tuple[list[tuple[str, dict]], Optional[str]]:
         """Fetch all pages from /Ledgers. Returns list of (ledger_id, entry_data)."""
         try:
             all_entries: list[tuple[str, dict]] = []
             offset = 0
             while True:
+                params = {"ofs": offset}
+                if start_time:
+                    params["start"] = int(start_time.timestamp())
                 data = await self._private_request(
-                    "/0/private/Ledgers", {"ofs": offset}, api_key, api_secret
+                    "/0/private/Ledgers", params, api_key, api_secret
                 )
                 entries = data.get("result", {}).get("ledger", {})
                 if not entries:
@@ -275,6 +321,7 @@ class KrakenConnector:
 
     async def _normalize_ledger_entry(
         self, entry: dict, ledger_id: str, trade_base_symbols: dict[str, str],
+        ledger_conversion_refs: dict[str, dict[str, tuple[str, Decimal | None]]],
         account_id: str, user_id: str,
     ) -> Optional[Transaction]:
         """Normalize a Kraken ledger entry (deposit, withdrawal, staking, trade quote-side)."""
@@ -293,9 +340,14 @@ class KrakenConnector:
                 return None
 
             is_stablecoin = symbol in KrakenConnector.STABLECOIN_SYMBOLS
+            ref_id = entry.get("refid", "")
+            conversion = ledger_conversion_refs.get(ref_id, {}).get(symbol)
+            conversion_price = None
 
             # Map ledger types to transaction types
-            if ledger_type == "staking":
+            if conversion:
+                txn_type, conversion_price = conversion
+            elif ledger_type == "staking":
                 txn_type = "STAKE_REWARD"
             elif ledger_type == "deposit":
                 txn_type = "TRANSFER_IN"
@@ -314,7 +366,6 @@ class KrakenConnector:
                 # Kraken Pay / on-chain receive
                 txn_type = "TRANSFER_IN"
             elif ledger_type == "trade":
-                ref_id = entry.get("refid", "")
                 base_sym = trade_base_symbols.get(ref_id)
                 if base_sym and base_sym == symbol:
                     # This is the base asset side — already imported via /TradesHistory
@@ -330,17 +381,7 @@ class KrakenConnector:
             fee = Decimal(str(entry.get("fee", 0)))
             time_val = entry.get("time", 0)
             txn_date = datetime.fromtimestamp(float(time_val), tz=timezone.utc)
-            ref_id = entry.get("refid", "")
-
-            # Use ledger_id (unique per entry) in import_hash to avoid collisions
-            import_hash = hashlib.sha256(f"kraken|ledger|{ledger_id}".encode()).hexdigest()
-            existing = await self.db.execute(
-                select(Transaction).where(Transaction.import_hash == import_hash)
-            )
-            if existing.scalar_one_or_none():
-                return None
-
-            price_per_unit = Decimal("1.0") if is_stablecoin else None
+            price_per_unit = conversion_price if conversion_price is not None else (Decimal("1.0") if is_stablecoin else None)
 
             # Kraken's `amount` is gross; `fee` is deducted separately.
             # For inflows: net received = amount - fee
@@ -349,6 +390,25 @@ class KrakenConnector:
                 net_quantity = amount - fee
             else:
                 net_quantity = abs(amount) + fee
+
+            # Use ledger_id (unique per entry) in import_hash to avoid collisions
+            import_hash = hashlib.sha256(f"kraken|ledger|{ledger_id}".encode()).hexdigest()
+            existing = await self.db.execute(
+                select(Transaction).where(Transaction.import_hash == import_hash)
+            )
+            existing_txn = existing.scalar_one_or_none()
+            if existing_txn:
+                if conversion:
+                    existing_txn.transaction_type = txn_type
+                    existing_txn.quantity = net_quantity
+                    existing_txn.price_per_unit = price_per_unit
+                    existing_txn.fees = fee
+                    existing_txn.net_amount = amount
+                    existing_txn.currency = "USD"
+                    existing_txn.transacted_at = txn_date
+                    existing_txn.raw_data = entry
+                    await self.db.flush()
+                return None
 
             asset_id = await self._resolve_asset(symbol)
             txn = Transaction(
@@ -373,14 +433,31 @@ class KrakenConnector:
             logger.warning(f"Failed to normalize Kraken ledger: {e}")
             return None
 
+    @classmethod
+    def _detect_ledger_conversion_refs(
+        cls,
+        ledger: list[tuple[str, dict]],
+        trade_base_symbols: dict[str, str],
+    ) -> dict[str, dict[str, tuple[str, Decimal | None]]]:
+        """
+        Detect Kraken Convert rows that only appear in the ledger.
+
+        Kraken Convert can show as paired positive/negative ledger rows rather
+        than /TradesHistory rows. Treat the received asset as BUY and the spent
+        asset as SELL so holdings/cost basis are reconstructed from trades,
+        not as external transfers.
+        """
+        return detect_ledger_conversion_refs(
+            ledger,
+            trade_base_symbols,
+            cls._normalize_asset,
+            cls.FIAT_SYMBOLS,
+            cls.STABLECOIN_SYMBOLS,
+        )
+
     async def _resolve_asset(self, symbol: str) -> Optional[str]:
-        result = await self.db.execute(select(Asset).where(Asset.symbol == symbol))
-        asset = result.scalar_one_or_none()
-        if not asset:
-            asset = Asset(symbol=symbol, name=symbol, asset_class="CRYPTO", currency="USD")
-            self.db.add(asset)
-            await self.db.flush()
-        elif asset.asset_class != "CRYPTO":
+        asset = await get_or_create_asset(self.db, symbol, "USD", "CRYPTO")
+        if asset.asset_class != "CRYPTO":
             # Fix misclassified crypto assets (e.g., BTC/ETH created as EQUITY by CSV import)
             asset.asset_class = "CRYPTO"
             await self.db.flush()
@@ -530,12 +607,7 @@ class CoinbaseConnector:
             return None
 
     async def _resolve_asset(self, symbol: str) -> Optional[str]:
-        result = await self.db.execute(select(Asset).where(Asset.symbol == symbol))
-        asset = result.scalar_one_or_none()
-        if not asset:
-            asset = Asset(symbol=symbol, name=symbol, asset_class="CRYPTO", currency="USD")
-            self.db.add(asset)
-            await self.db.flush()
+        asset = await get_or_create_asset(self.db, symbol, "USD", "CRYPTO")
         return asset.id
 
     def _sign_request(self, method: str, path: str, api_key: str, api_secret: str) -> dict:
@@ -631,12 +703,7 @@ class BinanceConnector:
             return None
 
     async def _resolve_asset(self, symbol: str) -> Optional[str]:
-        result = await self.db.execute(select(Asset).where(Asset.symbol == symbol))
-        asset = result.scalar_one_or_none()
-        if not asset:
-            asset = Asset(symbol=symbol, name=symbol, asset_class="CRYPTO", currency="USD")
-            self.db.add(asset)
-            await self.db.flush()
+        asset = await get_or_create_asset(self.db, symbol, "USD", "CRYPTO")
         return asset.id
 
     @staticmethod
@@ -699,12 +766,6 @@ class IBKRFlexConnector:
             "cash_transactions_found": cash_count,
             "dividend_accruals_found": dividend_count,
         }
-        if trade_count == 0 and cash_count == 0 and dividend_count == 0:
-            result["error"] = (
-                "IBKR returned a Flex report, but it did not contain Trades, Cash Transactions, "
-                "or Change in Dividend Accruals rows. Edit the Activity Flex Query to include those sections, "
-                "set delivery format to XML, save it, then sync again."
-            )
         return result
 
     async def _fetch_statement(self, flex_token: str, query_id: str) -> str:
@@ -933,20 +994,15 @@ class IBKRFlexConnector:
             return None
 
     async def _resolve_asset(self, symbol: str, currency: str, data: dict) -> Optional[str]:
-        result = await self.db.execute(select(Asset).where(Asset.symbol == symbol))
-        asset = result.scalar_one_or_none()
-        if not asset:
-            asset_category = self._value(data, "assetCategory", "AssetCategory", "AssetClass").upper()
-            asset_class = "ETF" if asset_category == "ETF" else "EQUITY"
-            asset = Asset(
-                symbol=symbol,
-                name=self._value(data, "description", "Description") or symbol,
-                asset_class=asset_class,
-                currency=currency,
-                isin=self._value(data, "isin", "ISIN") or None,
-            )
-            self.db.add(asset)
-            await self.db.flush()
+        asset_category = self._value(data, "assetCategory", "AssetCategory", "AssetClass").upper()
+        asset = await get_or_create_asset(
+            self.db,
+            symbol,
+            currency,
+            "ETF" if asset_category == "ETF" else "EQUITY",
+            name=self._value(data, "description", "Description") or symbol,
+            isin=self._value(data, "isin", "ISIN") or None,
+        )
         return asset.id
 
     @staticmethod
@@ -1134,19 +1190,14 @@ class PlaidConnector:
             return None
 
     async def _resolve_asset(self, symbol: str, security_data: dict) -> Optional[str]:
-        result = await self.db.execute(select(Asset).where(Asset.symbol == symbol))
-        asset = result.scalar_one_or_none()
-        if not asset:
-            asset = Asset(
-                symbol=symbol,
-                name=security_data.get("name", symbol),
-                asset_class="EQUITY",
-                isin=security_data.get("isin"),
-                cusip=security_data.get("cusip"),
-                currency="USD",
-            )
-            self.db.add(asset)
-            await self.db.flush()
+        asset = await get_or_create_asset(
+            self.db,
+            symbol,
+            "USD",
+            name=security_data.get("name", symbol),
+            isin=security_data.get("isin"),
+            cusip=security_data.get("cusip"),
+        )
         return asset.id
 
     @staticmethod

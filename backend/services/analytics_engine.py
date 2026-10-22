@@ -6,6 +6,7 @@ using vectorized NumPy/Pandas operations.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -90,8 +91,11 @@ class AnalyticsEngine:
         cost_basis_method: str = "FIFO",
         account_ids: list[str] | None = None,
         display_currency: str = "AUD",
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> AnalyticsBundle:
-        start, end = self._period_to_dates(period)
+        if start is None or end is None:
+            start, end = self._period_to_dates(period)
 
         # Get current portfolio snapshot
         current = await self.portfolio_engine.get_portfolio_summary(
@@ -342,7 +346,7 @@ class AnalyticsEngine:
         would replay the portfolio daily.
         """
         current = await self.portfolio_engine.get_portfolio_summary(
-            user_id=user_id, account_ids=account_ids, display_currency=display_currency,
+            user_id=user_id, account_ids=account_ids, display_currency="AUD",
         )
         if not current.holdings:
             return pd.Series(dtype=float)
@@ -355,16 +359,22 @@ class AnalyticsEngine:
         all_prices: dict[str, list[dict]] = {}
 
         logger.info(f"Building portfolio series for {len(symbols)} symbols from {start.date()} to {end.date()}")
-        for sym in symbols:
+        semaphore = asyncio.Semaphore(6)
+
+        async def fetch_symbol_prices(sym: str) -> tuple[str, list[dict]]:
             try:
-                sym_ccy = FXService._normalize_currency(holdings_by_symbol[sym].original_currency or "USD")
-                prices = await self.market_data.get_historical_prices(sym, start, end, currency=sym_ccy)
-                if prices:
-                    all_prices[sym] = prices
-                else:
-                    logger.warning(f"No historical prices returned for {sym}")
+                async with semaphore:
+                    sym_ccy = FXService._normalize_currency(holdings_by_symbol[sym].original_currency or "USD")
+                    prices = await self.market_data.get_historical_prices(sym, start, end, currency=sym_ccy)
+                    if not prices:
+                        logger.warning(f"No historical prices returned for {sym}")
+                    return sym, prices or []
             except Exception as e:
                 logger.warning(f"Failed to fetch history for {sym}: {e}")
+                return sym, []
+
+        fetched_prices = await asyncio.gather(*(fetch_symbol_prices(sym) for sym in symbols))
+        all_prices = {sym: prices for sym, prices in fetched_prices if prices}
 
         if not all_prices:
             logger.warning("No historical price data available for any holding")
@@ -372,7 +382,7 @@ class AnalyticsEngine:
 
         # Build DataFrame of prices
         frames = []
-        display_ccy = FXService._normalize_currency(display_currency)
+        base_ccy = "AUD"
         fx = FXService()
         fx_cache: dict[tuple[str, str, str], float] = {}
 
@@ -381,16 +391,17 @@ class AnalyticsEngine:
             df["date"] = pd.to_datetime(df["date"])
             df = df.set_index("date")[["close"]].rename(columns={"close": sym})
             sym_ccy = FXService._normalize_currency(holdings_by_symbol[sym].original_currency or "USD")
-            if sym_ccy != display_ccy:
+            if sym_ccy != base_ccy:
                 unique_days = df.index.date
+                await fx.prefetch_rates(sym_ccy, base_ccy, pd.unique(unique_days))
                 for day in pd.unique(unique_days):
-                    key = (sym_ccy, display_ccy, day.isoformat())
+                    key = (sym_ccy, base_ccy, day.isoformat())
                     if key not in fx_cache:
                         dt = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
-                        rate = await fx.get_rate_on_date(sym_ccy, display_ccy, dt)
+                        rate = await fx.get_rate_on_date(sym_ccy, base_ccy, dt)
                         fx_cache[key] = float(rate)
                 df[sym] = df.apply(
-                    lambda r: r[sym] * fx_cache[(sym_ccy, display_ccy, r.name.date().isoformat())], axis=1
+                    lambda r: r[sym] * fx_cache[(sym_ccy, base_ccy, r.name.date().isoformat())], axis=1
                 )
             frames.append(df)
 
@@ -407,15 +418,23 @@ class AnalyticsEngine:
             if h.symbol in price_df.columns and h.market_value:
                 weights[h.symbol] = float(h.market_value) / total_mv if total_mv > 0 else 0
 
-        # Compute weighted portfolio value (indexed to current value)
+        # Compute weighted portfolio value in AUD, then use a constant display
+        # conversion so returns and gain/loss signs do not change on toggle.
         portfolio_values = pd.Series(0.0, index=price_df.index)
         for sym, w in weights.items():
             if sym in price_df.columns:
                 normalized = price_df[sym] / price_df[sym].iloc[-1]
                 portfolio_values += normalized * w * total_mv
 
+        result = portfolio_values.dropna()
+        target_ccy = FXService._normalize_currency(display_currency)
+        if target_ccy != "AUD" and not result.empty:
+            target_to_aud = await fx.get_rate_on_date(target_ccy, "AUD", end)
+            if float(target_to_aud) != 0:
+                result = result * float(Decimal("1.0") / target_to_aud)
+
         await fx.close()
-        return portfolio_values.dropna()
+        return result
 
     async def _build_benchmark_series(
         self,
@@ -426,7 +445,14 @@ class AnalyticsEngine:
     ) -> pd.Series:
         benchmark_ccy = "AUD" if symbol.upper().endswith(".AX") else "USD"
         clean_symbol = symbol[:-3] if symbol.upper().endswith(".AX") else symbol
-        prices = await self.market_data.get_historical_prices(clean_symbol, start, end, currency=benchmark_ccy)
+        yahoo_crypto_symbols = {
+            "BTC": "BTC-USD",
+            "ETH": "ETH-USD",
+        }
+        history_symbol = yahoo_crypto_symbols.get(clean_symbol.upper(), clean_symbol)
+        prices = await self.market_data.get_historical_prices(history_symbol, start, end, currency=benchmark_ccy)
+        if not prices and history_symbol != clean_symbol:
+            prices = await self.market_data.get_historical_prices(clean_symbol, start, end, currency=benchmark_ccy)
         if not prices:
             return pd.Series(dtype=float)
         df = pd.DataFrame(prices)
@@ -434,17 +460,28 @@ class AnalyticsEngine:
         df = df.set_index("date")
         series = df["close"].dropna()
 
-        display_ccy = FXService._normalize_currency(display_currency)
-        if benchmark_ccy == display_ccy or series.empty:
+        if series.empty:
             return series
 
+        base_ccy = "AUD"
+        target_ccy = FXService._normalize_currency(display_currency)
         fx = FXService()
         try:
-            rates: dict[str, float] = {}
-            for day in pd.unique(series.index.date):
-                dt = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
-                rates[day.isoformat()] = float(await fx.get_rate_on_date(benchmark_ccy, display_ccy, dt))
-            return series * series.index.to_series().apply(lambda d: rates[d.date().isoformat()]).to_numpy()
+            result = series
+            if benchmark_ccy != base_ccy:
+                rates: dict[str, float] = {}
+                await fx.prefetch_rates(benchmark_ccy, base_ccy, pd.unique(series.index.date))
+                for day in pd.unique(series.index.date):
+                    dt = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+                    rates[day.isoformat()] = float(await fx.get_rate_on_date(benchmark_ccy, base_ccy, dt))
+                result = series * series.index.to_series().apply(lambda d: rates[d.date().isoformat()]).to_numpy()
+
+            if target_ccy != base_ccy:
+                target_to_aud = await fx.get_rate_on_date(target_ccy, base_ccy, end)
+                if float(target_to_aud) != 0:
+                    result = result * float(Decimal("1.0") / target_to_aud)
+
+            return result
         finally:
             await fx.close()
 
@@ -480,8 +517,15 @@ class AnalyticsEngine:
         if base_value <= 0:
             return portfolio, benchmarks
 
-        for symbol in benchmark_symbols:
+        async def build_one_benchmark(symbol: str) -> tuple[str, pd.Series | None]:
             try:
+                if symbol.upper() in {"CASH", "CASH5", "CASH_5", "CASH5PCT"}:
+                    return symbol, self._build_cash_benchmark_series(
+                        chart_index,
+                        base_value,
+                        annual_rate=0.05,
+                    )
+
                 benchmark = await self._build_benchmark_series(
                     symbol,
                     start,
@@ -494,11 +538,34 @@ class AnalyticsEngine:
                     base_value,
                 )
                 if not indexed.empty:
-                    benchmarks[symbol] = indexed
+                    return symbol, indexed
             except Exception as e:
                 logger.warning(f"Failed to build benchmark comparison for {symbol}: {e}")
+            return symbol, None
+
+        benchmark_results = await asyncio.gather(*(build_one_benchmark(symbol) for symbol in benchmark_symbols))
+        for symbol, series in benchmark_results:
+            if series is not None and not series.empty:
+                benchmarks[symbol] = series
 
         return portfolio, benchmarks
+
+    @staticmethod
+    def _build_cash_benchmark_series(
+        chart_index: pd.Index,
+        base_value: float,
+        annual_rate: float = 0.05,
+    ) -> pd.Series:
+        """Build a synthetic cash return line compounded daily."""
+        if len(chart_index) == 0 or base_value <= 0:
+            return pd.Series(dtype=float)
+
+        first_date = chart_index[0]
+        values = []
+        for date in chart_index:
+            days = max((date - first_date).days, 0)
+            values.append(base_value * ((1 + annual_rate) ** (days / 365.0)))
+        return pd.Series(values, index=chart_index)
 
     @staticmethod
     def _index_benchmark_to_portfolio_base(

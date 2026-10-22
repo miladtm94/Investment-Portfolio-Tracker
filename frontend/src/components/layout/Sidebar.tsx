@@ -1,24 +1,26 @@
 "use client";
 
 import Link from "next/link";
+import type { Route } from "next";
 import { usePathname } from "next/navigation";
 import clsx from "clsx";
 import {
-  LayoutDashboard, Briefcase, ArrowLeftRight, BarChart2,
-  Bot, FileText, RefreshCw, Settings, TrendingUp, Zap, Upload, LogOut,
+  LayoutDashboard, ArrowLeftRight,
+  Bot, FileText, TrendingUp, LogOut,
   Globe, Star, History,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth/AuthContext";
 
-const INVEST_NAV = [
+type NavItem = { href: Route; label: string; icon: typeof LayoutDashboard; badge: string | null };
+
+const INVEST_NAV: NavItem[] = [
   { href: "/dashboard",              label: "Dashboard",   icon: LayoutDashboard, badge: null },
   { href: "/dashboard/transactions", label: "Investments", icon: ArrowLeftRight,  badge: null },
-  { href: "/dashboard/analytics",    label: "Analytics",   icon: BarChart2,       badge: null },
   { href: "/dashboard/advisor",      label: "AI Advisor",  icon: Bot,             badge: "AI" },
   { href: "/dashboard/tax",          label: "Tax Center",  icon: FileText,        badge: null },
 ];
 
-const TRADING_NAV = [
+const TRADING_NAV: NavItem[] = [
   { href: "/dashboard/markets",          label: "Markets",        icon: Globe,    badge: null },
   { href: "/dashboard/watchlist",        label: "Watchlist",      icon: Star,     badge: null },
   { href: "/dashboard/analysis/history", label: "AI History",     icon: History,  badge: null },

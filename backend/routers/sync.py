@@ -1,7 +1,7 @@
 """Sync router — broker and exchange account synchronization."""
 import logging
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -11,7 +11,6 @@ from shared.models import Account, ApiCredential, User
 from shared.auth import get_current_user
 from shared.cache import cache_delete_pattern, cache_invalidate_user
 from services.sync_service import SyncService
-from services.dividend_service import DividendService
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +36,7 @@ class SyncResponse(BaseModel):
     provider: str
     account_id: str
     error: Optional[str] = None
+    mode: Optional[str] = None
 
 
 @router.post("/connect/exchange", response_model=dict, status_code=201)
@@ -137,12 +137,13 @@ async def connect_broker(
 @router.post("/accounts/{account_id}/trigger", response_model=SyncResponse)
 async def trigger_sync(
     account_id: str,
+    recent: bool = Query(False, description="Fetch only recent provider data when possible"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Manually trigger a sync for an account."""
     svc = SyncService(db)
-    result = await svc.sync_account(account_id, current_user.id)
+    result = await svc.sync_account(account_id, current_user.id, recent_only=recent)
     await svc.close()
 
     return SyncResponse(
@@ -150,6 +151,7 @@ async def trigger_sync(
         provider=result.get("provider", "unknown"),
         account_id=account_id,
         error=result.get("error"),
+        mode=result.get("mode"),
     )
 
 
@@ -173,29 +175,47 @@ async def get_sync_status(
     }
 
 
-@router.post("/refresh-all")
-async def refresh_all(
+@router.post("/refresh-market")
+async def refresh_market(
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
 ):
     """
-    Full dashboard refresh:
-    1. Flush cached FX rates and market prices
-    2. Sync all API-connected accounts (Kraken, etc.)
+    Fast dashboard refresh:
+    1. Flush spot market price caches
+    2. Flush today's FX rates
     3. Invalidate portfolio/analytics caches
+
+    This intentionally does not sync broker transactions. Broker sync is
+    handled per account via /sync/accounts/{account_id}/trigger.
     """
     steps: list[dict] = []
 
-    # 1. Flush only spot price caches (short-lived anyway, 60s TTL)
-    #    Keep historical price and FX caches intact to avoid rate-limit issues
     spot_cleared = await cache_delete_pattern("market:price:*:spot")
-    # Flush today's FX rates (1h TTL) so they refresh, keep historical rates
     from datetime import datetime, timezone
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     fx_cleared = await cache_delete_pattern(f"fx:*:{today_str}")
     steps.append({"step": "cache_flush", "spot_keys": spot_cleared, "fx_keys": fx_cleared})
 
-    # 2. Find all API-connected accounts and sync them
+    await cache_invalidate_user(current_user.id)
+    steps.append({"step": "cache_invalidate"})
+
+    return {
+        "status": "completed",
+        "accounts_synced": 0,
+        "total_imported": 0,
+        "errors": [],
+        "steps": steps,
+    }
+
+
+@router.post("/refresh-all")
+async def refresh_all(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Refresh market data and import new transactions for connected accounts."""
+    refresh_result = await refresh_market(current_user)
+
     cred_result = await db.execute(
         select(ApiCredential).where(
             ApiCredential.user_id == current_user.id,
@@ -206,51 +226,48 @@ async def refresh_all(
     credentials = cred_result.scalars().all()
 
     sync_results: list[dict] = []
-    for cred in credentials:
-        if not cred.account_id:
+    synced_account_ids: set[str] = set()
+    for credential in credentials:
+        account_id = credential.account_id
+        if not account_id or account_id in synced_account_ids:
             continue
+        synced_account_ids.add(account_id)
+
+        svc = SyncService(db)
         try:
-            svc = SyncService(db)
-            result = await svc.sync_account(cred.account_id, current_user.id)
-            await svc.close()
+            result = await svc.sync_account(
+                account_id,
+                current_user.id,
+                recent_only=True,
+            )
             sync_results.append({
-                "account_id": cred.account_id,
-                "provider": cred.provider,
+                "account_id": account_id,
+                "provider": result.get("provider", credential.provider.lower()),
                 "imported": result.get("imported", 0),
                 "error": result.get("error"),
+                "mode": result.get("mode"),
             })
-        except Exception as e:
-            logger.warning(f"Sync failed for {cred.provider} account {cred.account_id}: {e}")
+        except Exception as exc:
+            logger.warning(
+                "Sync failed for %s account %s: %s",
+                credential.provider,
+                account_id,
+                exc,
+            )
             sync_results.append({
-                "account_id": cred.account_id,
-                "provider": cred.provider,
+                "account_id": account_id,
+                "provider": credential.provider.lower(),
                 "imported": 0,
-                "error": str(e),
+                "error": str(exc),
             })
-    steps.append({"step": "sync_accounts", "results": sync_results})
+        finally:
+            await svc.close()
 
-    # 3. Fetch US equity dividends via Polygon
-    dividend_svc = DividendService(db)
-    try:
-        dividend_result = await dividend_svc.sync_us_dividends(current_user)
-    finally:
-        await dividend_svc.close()
-    steps.append({"step": "dividends", "result": dividend_result})
-
-    # 4. Invalidate portfolio/analytics caches so fresh prices are used
+    # Account sync invalidates caches itself, but repeat once after the batch so
+    # accounts that returned an error cannot leave stale transaction-derived data.
     await cache_invalidate_user(current_user.id)
-    steps.append({"step": "cache_invalidate"})
-
-    dividend_inserted = dividend_result.get("inserted", 0) if isinstance(dividend_result, dict) else 0
-    total_imported = sum(r["imported"] for r in sync_results) + dividend_inserted
-    errors = [r for r in sync_results if r.get("error")]
-    if isinstance(dividend_result, dict) and dividend_result.get("errors"):
-        errors.extend(dividend_result.get("errors"))
-
-    return {
-        "status": "completed",
-        "accounts_synced": len(sync_results),
-        "total_imported": total_imported,
-        "errors": errors,
-        "steps": steps,
-    }
+    refresh_result["steps"].append({"step": "sync_accounts", "results": sync_results})
+    refresh_result["accounts_synced"] = len(sync_results)
+    refresh_result["total_imported"] = sum(item["imported"] for item in sync_results)
+    refresh_result["errors"] = [item for item in sync_results if item.get("error")]
+    return refresh_result

@@ -39,6 +39,44 @@ class User(Base):
     watchlist_items: Mapped[list["WatchlistItem"]] = relationship("WatchlistItem", back_populates="user", cascade="all, delete-orphan")
 
 
+class TaxYearSettings(Base):
+    """User-entered assumptions and reconciliation adjustments for one AU FY."""
+    __tablename__ = "tax_year_settings"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    fy_end_year: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    other_income_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    other_deductions_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    investment_deductions_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    prior_year_capital_losses_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    tax_withheld_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    other_tax_offsets_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    other_foreign_tax_offsets_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    medicare_levy_exemption_pct: Mapped[Decimal] = mapped_column(Numeric(5, 2), default=0)
+    resident_full_year: Mapped[bool] = mapped_column(Boolean, default=True)
+    franking_credits_eligible: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # Adjustments reconcile incomplete broker feeds to annual tax statements.
+    other_franked_dividends_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    other_unfranked_dividends_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    other_foreign_dividends_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    other_franking_credits_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    foreign_tax_paid_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    other_interest_income_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    other_staking_income_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    other_non_discount_capital_gains_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    other_discount_capital_gains_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+    other_capital_losses_aud: Mapped[Decimal] = mapped_column(Numeric(28, 2), default=0)
+
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (UniqueConstraint("user_id", "fy_end_year", name="uq_tax_year_settings_user_fy"),)
+
+
 class Account(Base):
     __tablename__ = "accounts"
 
@@ -376,4 +414,55 @@ class AnalysisResult(Base):
         Index("ix_analysis_results_user_id", "user_id"),
         Index("ix_analysis_results_symbol", "symbol"),
         Index("ix_analysis_results_created_at", "created_at"),
+    )
+
+
+class SignalCheck(Base):
+    """Tracks deterministic technical signals and their after-N-days outcome."""
+    __tablename__ = "signal_checks"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    asset_class: Mapped[str] = mapped_column(String(20), nullable=False)
+    exchange: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    currency: Mapped[str] = mapped_column(String(3), default="USD")
+    interval: Mapped[str] = mapped_column(String(10), nullable=False)
+
+    signal: Mapped[str] = mapped_column(String(20), nullable=False)
+    score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    confidence: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    action: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+
+    signal_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evaluation_days: Mapped[int] = mapped_column(Integer, default=7)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")  # PENDING|EVALUATED
+
+    current_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
+    entry_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
+    entry_zone_low: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
+    entry_zone_high: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
+    stop_loss: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
+    take_profit_1: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
+    take_profit_2: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
+    take_profit_3: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 6), nullable=True)
+    risk_reward: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4), nullable=True)
+
+    payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    outcome: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    outcome_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    outcome_correct: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    outcome_return_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4), nullable=True)
+    checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_signal_checks_user_id", "user_id"),
+        Index("ix_signal_checks_symbol", "symbol"),
+        Index("ix_signal_checks_due_at", "due_at"),
+        Index("ix_signal_checks_status", "status"),
     )

@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone, timedelta, date
 from decimal import Decimal
-from typing import Optional
+from typing import Iterable, Optional
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -102,6 +102,39 @@ class FXService:
         logger.error(f"Could not fetch FX rate {from_c}/{to_c} for {date_str}. Using 1.0 — CHECK THIS.")
         return Decimal("1.0")
 
+    async def prefetch_rates(self, from_currency: str, to_currency: str, days: Iterable[date]) -> None:
+        """
+        Warm the cache for many dates with a single Yahoo range request, so
+        per-day get_rate_on_date() calls (e.g. a 1Y daily series) don't make
+        one HTTP round-trip each. Each day gets the last close on or before it,
+        matching _yahoo_rate. Days that can't be filled fall back to per-day lookup.
+        """
+        from_c = self._normalize_currency(from_currency)
+        to_c = self._normalize_currency(to_currency)
+        if from_c == to_c:
+            return
+
+        missing = sorted({d for d in days if f"fx:{from_c}:{to_c}:{d.isoformat()}" not in self._session_cache})
+        if not missing:
+            return
+
+        closes = await self._yahoo_range(from_c, to_c, missing[0] - timedelta(days=5), missing[-1] + timedelta(days=1))
+        if not closes:
+            return
+
+        today = datetime.now(timezone.utc).date()
+        bar_days = sorted(closes)
+        i, last = 0, None
+        for d in missing:
+            while i < len(bar_days) and bar_days[i] <= d:
+                last = closes[bar_days[i]]
+                i += 1
+            if last is None:
+                continue
+            cache_key = f"fx:{from_c}:{to_c}:{d.isoformat()}"
+            self._session_cache[cache_key] = last
+            await cache_set(cache_key, float(last), ttl=86400 if d < today else 3600)
+
     async def get_aud_rate(self, foreign_currency: str, on_date: Optional[datetime] = None) -> Decimal:
         """
         How many AUD does 1 unit of foreign_currency cost?
@@ -183,6 +216,30 @@ class FXService:
         except Exception as e:
             logger.debug(f"Yahoo FX error {from_c}/{to_c}: {e}")
         return None
+
+    async def _yahoo_range(self, from_c: str, to_c: str, start: date, end: date) -> dict[date, Decimal]:
+        """Daily closes for a pair over [start, end], keyed by UTC bar date."""
+        try:
+            pair = f"{from_c}{to_c}=X"
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{pair}"
+            period1 = int(datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc).timestamp())
+            period2 = int(datetime.combine(end, datetime.min.time(), tzinfo=timezone.utc).timestamp())
+            resp = await self._http.get(
+                url, headers={"User-Agent": "Mozilla/5.0"},
+                params={"interval": "1d", "period1": period1, "period2": period2},
+            )
+            resp.raise_for_status()
+            result = resp.json()["chart"]["result"][0]
+            timestamps = result.get("timestamp") or []
+            closes = result["indicators"]["quote"][0]["close"]
+            return {
+                datetime.fromtimestamp(ts, tz=timezone.utc).date(): Decimal(str(c)).quantize(Decimal("0.000001"))
+                for ts, c in zip(timestamps, closes)
+                if c is not None
+            }
+        except Exception as e:
+            logger.debug(f"Yahoo FX range error {from_c}/{to_c}: {e}")
+            return {}
 
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=5))
     async def _rba_rate(self, foreign_currency: str, on_date: datetime) -> Optional[Decimal]:

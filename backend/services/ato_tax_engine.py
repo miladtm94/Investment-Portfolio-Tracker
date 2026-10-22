@@ -1,576 +1,700 @@
-"""
-ATO Capital Gains Tax Engine — Australia.
+"""Australian investment tax calculations.
 
-Implements ATO CGT rules per the Income Tax Assessment Act 1997:
-  - Australian Financial Year: 1 July – 30 June
-  - CGT discount: 50% for individuals, 33.33% for SMSFs (assets held ≥ 365 days)
-  - Cost base in AUD (using RBA/commercial FX rate at date of acquisition)
-  - Capital losses offset gains; losses applied to non-discount gains first
-  - No wash-sale rule equivalent in Australia
-  - Marginal tax rates 2024-25 including 2% Medicare Levy
-  - Dividend imputation / franking credits tracked
+The engine deliberately rebuilds parcels from the transaction ledger.  The
+application historically queried ``tax_lots`` even though no importer creates
+those rows, which made every Tax Centre report empty.
 
-References:
-  ATO CGT: https://www.ato.gov.au/individuals-and-families/investments-and-assets/capital-gains-tax
-  Cost base: https://www.ato.gov.au/individuals-and-families/investments-and-assets/capital-gains-tax/calculating-your-cgt/cost-base
+Amounts are calculated in AUD at the transaction date.  The report is an
+investment-tax workpaper for an Australian-resident individual, not an ATO
+assessment: residency, private health insurance, HELP and unusual CGT events
+can change the final liability.
 """
 from __future__ import annotations
 
-import logging
+from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, date
+from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional
+from typing import Any, Optional
 
-from sqlalchemy import select, and_
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.models import TaxLot, Transaction, Asset
 from services.fx_service import FXService
-from services.market_data_service import MarketDataService
-
-logger = logging.getLogger(__name__)
+from shared.models import Account, Asset, Transaction
 
 ZERO = Decimal("0")
 CENT = Decimal("0.01")
-
-# ── ATO Marginal Tax Rates 2024–25 (individuals, residents) ─────────────────
-# Each band: (threshold, base_tax, marginal_rate)
-ATO_TAX_BRACKETS_2024_25 = [
-    (Decimal("18200"),  Decimal("0"),      Decimal("0.00")),
-    (Decimal("45000"),  Decimal("0"),      Decimal("0.19")),
-    (Decimal("120000"), Decimal("5092"),   Decimal("0.325")),
-    (Decimal("180000"), Decimal("29467"),  Decimal("0.37")),
-    (Decimal("999999999"), Decimal("51667"), Decimal("0.45")),
-]
-MEDICARE_LEVY = Decimal("0.02")
-LOW_INCOME_TAX_OFFSET_MAX = Decimal("700")   # LITO: $700 offset, phases out $37.5k–$66.7k
-LOW_INCOME_THRESHOLD = Decimal("37500")
-LITO_PHASE_OUT_END = Decimal("66667")
+QTY = Decimal("0.0000000001")
+SUPPORTED_METHODS = {"FIFO", "LIFO", "HIFO", "TAX_OPTIMAL"}
 
 
-def ato_income_tax(taxable_income: Decimal) -> Decimal:
-    """Compute ATO income tax for given taxable income (2024-25 rates)."""
-    if taxable_income <= ZERO:
-        return ZERO
-
-    tax = ZERO
-    prev_threshold = ZERO
-    for threshold, base, rate in ATO_TAX_BRACKETS_2024_25:
-        if taxable_income <= prev_threshold:
-            break
-        band_income = min(taxable_income, threshold) - prev_threshold
-        if taxable_income > prev_threshold:
-            if prev_threshold == ZERO and rate == ZERO:
-                pass  # tax-free threshold
-            else:
-                tax += band_income * rate
-        prev_threshold = threshold
-
-    # Simplified LITO
-    if taxable_income <= LOW_INCOME_THRESHOLD:
-        lito = LOW_INCOME_TAX_OFFSET_MAX
-    elif taxable_income <= LITO_PHASE_OUT_END:
-        lito = LOW_INCOME_TAX_OFFSET_MAX - (taxable_income - LOW_INCOME_THRESHOLD) * Decimal("0.025")
-    else:
-        lito = ZERO
-
-    tax = max(ZERO, tax - lito)
-    # Medicare Levy (full rate above $26,000, phased in below)
-    medicare = taxable_income * MEDICARE_LEVY if taxable_income > Decimal("26000") else ZERO
-    return (tax + medicare).quantize(CENT, rounding=ROUND_HALF_UP)
-
-
-def ato_marginal_rate(taxable_income: Decimal) -> Decimal:
-    """Return the marginal income tax rate for a given taxable income level."""
-    for threshold, _, rate in ATO_TAX_BRACKETS_2024_25:
-        if taxable_income <= threshold:
-            return rate + MEDICARE_LEVY
-    return Decimal("0.47")  # top rate + medicare
+def money(value: Decimal | float | int | str | None) -> Decimal:
+    return Decimal(str(value or 0)).quantize(CENT, rounding=ROUND_HALF_UP)
 
 
 def au_financial_year(dt: datetime) -> int:
-    """
-    Return the Australian financial year end for a datetime.
-    FY2024-25 = July 1, 2024 to June 30, 2025 → returns 2025.
-    """
-    if dt.month >= 7:
-        return dt.year + 1
-    return dt.year
+    """Return the end year (2025) for an Australian FY (2024-25)."""
+    return dt.year + 1 if dt.month >= 7 else dt.year
 
 
 def au_fy_bounds(fy_end_year: int) -> tuple[datetime, datetime]:
-    """Return (start, end) UTC datetimes for an Australian financial year."""
-    start = datetime(fy_end_year - 1, 7, 1, 0, 0, 0, tzinfo=timezone.utc)
-    end = datetime(fy_end_year, 6, 30, 23, 59, 59, tzinfo=timezone.utc)
-    return start, end
+    return (
+        datetime(fy_end_year - 1, 7, 1, tzinfo=timezone.utc),
+        datetime(fy_end_year, 6, 30, 23, 59, 59, 999999, tzinfo=timezone.utc),
+    )
 
 
-# ── Data classes ─────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class TaxRules:
+    fy_end_year: int
+    brackets: tuple[tuple[Decimal, Decimal], ...]
+    medicare_lower: Decimal
+    medicare_upper: Decimal
+    cgt_discount_rate: Decimal = Decimal("0.50")
+    lito_max: Decimal = Decimal("700")
+
+
+def rules_for_fy(fy_end_year: int) -> TaxRules:
+    """Legislated resident-individual settings, selected by income year."""
+    if fy_end_year <= 2024:
+        brackets = ((Decimal("18200"), ZERO), (Decimal("45000"), Decimal("0.19")),
+                    (Decimal("120000"), Decimal("0.325")), (Decimal("180000"), Decimal("0.37")),
+                    (Decimal("999999999"), Decimal("0.45")))
+        if fy_end_year == 2024:
+            medicare = (Decimal("26000"), Decimal("32500"))
+        elif fy_end_year == 2023:
+            medicare = (Decimal("24276"), Decimal("30345"))
+        elif fy_end_year == 2022:
+            medicare = (Decimal("23365"), Decimal("29207"))
+        else:
+            medicare = (Decimal("23226"), Decimal("29033"))
+    elif fy_end_year == 2025:
+        brackets = ((Decimal("18200"), ZERO), (Decimal("45000"), Decimal("0.16")),
+                    (Decimal("135000"), Decimal("0.30")), (Decimal("190000"), Decimal("0.37")),
+                    (Decimal("999999999"), Decimal("0.45")))
+        medicare = (Decimal("27222"), Decimal("34027"))
+    elif fy_end_year in (2026, 2027):
+        first_rate = Decimal("0.15") if fy_end_year == 2027 else Decimal("0.16")
+        brackets = ((Decimal("18200"), ZERO), (Decimal("45000"), first_rate),
+                    (Decimal("135000"), Decimal("0.30")), (Decimal("190000"), Decimal("0.37")),
+                    (Decimal("999999999"), Decimal("0.45")))
+        medicare = (Decimal("28011"), Decimal("35013"))
+    else:
+        # The 14% first rate is legislated from 2027-28. Thresholds that are
+        # indexed annually remain visible/editable in the UI as an estimate.
+        brackets = ((Decimal("18200"), ZERO), (Decimal("45000"), Decimal("0.14")),
+                    (Decimal("135000"), Decimal("0.30")), (Decimal("190000"), Decimal("0.37")),
+                    (Decimal("999999999"), Decimal("0.45")))
+        medicare = (Decimal("28011"), Decimal("35013"))
+    return TaxRules(fy_end_year, brackets, *medicare)
+
+
+def basic_income_tax(taxable_income: Decimal, rules: TaxRules) -> Decimal:
+    """Resident individual income tax before offsets and Medicare levy."""
+    income = max(ZERO, Decimal(taxable_income))
+    tax = ZERO
+    lower = ZERO
+    for upper, rate in rules.brackets:
+        if income <= lower:
+            break
+        tax += (min(income, upper) - lower) * rate
+        lower = upper
+    return money(tax)
+
+
+def low_income_tax_offset(taxable_income: Decimal, maximum: Decimal = Decimal("700")) -> Decimal:
+    income = max(ZERO, Decimal(taxable_income))
+    if income <= Decimal("37500"):
+        return maximum
+    if income <= Decimal("45000"):
+        return max(ZERO, maximum - (income - Decimal("37500")) * Decimal("0.05"))
+    if income <= Decimal("66667"):
+        return max(ZERO, Decimal("325") - (income - Decimal("45000")) * Decimal("0.015"))
+    return ZERO
+
+
+def medicare_levy(taxable_income: Decimal, rules: TaxRules, exemption_pct: Decimal = ZERO) -> Decimal:
+    income = max(ZERO, Decimal(taxable_income))
+    if income <= rules.medicare_lower:
+        levy = ZERO
+    elif income < rules.medicare_upper:
+        levy = min(income * Decimal("0.02"), (income - rules.medicare_lower) * Decimal("0.10"))
+    else:
+        levy = income * Decimal("0.02")
+    factor = max(ZERO, Decimal("1") - min(Decimal("100"), exemption_pct) / Decimal("100"))
+    return money(levy * factor)
+
+
+@dataclass
+class TaxCalculation:
+    taxable_income: Decimal
+    basic_tax: Decimal
+    lito: Decimal
+    medicare_levy: Decimal
+    non_refundable_offsets: Decimal
+    refundable_offsets: Decimal
+    tax_after_offsets: Decimal
+    tax_withheld: Decimal
+    estimated_amount_due: Decimal
+    estimated_refund: Decimal
+
+
+def calculate_tax(
+    taxable_income: Decimal,
+    rules: TaxRules,
+    *,
+    franking_offsets: Decimal = ZERO,
+    foreign_tax_offsets: Decimal = ZERO,
+    other_offsets: Decimal = ZERO,
+    tax_withheld: Decimal = ZERO,
+    medicare_exemption_pct: Decimal = ZERO,
+) -> TaxCalculation:
+    taxable = money(max(ZERO, taxable_income))
+    basic = basic_income_tax(taxable, rules)
+    lito = money(min(basic, low_income_tax_offset(taxable, rules.lito_max)))
+    levy = medicare_levy(taxable, rules, medicare_exemption_pct)
+    after_lito = max(ZERO, basic - lito) + levy
+    # FITO may also reduce Medicare liabilities. Other user-entered offsets are
+    # treated conservatively as non-refundable.
+    non_ref = money(max(ZERO, foreign_tax_offsets) + max(ZERO, other_offsets))
+    after_non_ref = max(ZERO, after_lito - non_ref)
+    refundable = money(max(ZERO, franking_offsets))
+    after_offsets = money(after_non_ref - refundable)
+    withheld = money(max(ZERO, tax_withheld))
+    balance = after_offsets - withheld
+    return TaxCalculation(
+        taxable, basic, lito, levy, non_ref, refundable, after_offsets, withheld,
+        money(max(ZERO, balance)), money(max(ZERO, -balance)),
+    )
+
+
+def _anniversary(acquired: date) -> date:
+    try:
+        return acquired.replace(year=acquired.year + 1)
+    except ValueError:  # 29 February
+        return acquired.replace(year=acquired.year + 1, day=28)
+
+
+def cgt_discount_eligible(acquired: datetime, disposed: datetime) -> bool:
+    # ATO excludes both acquisition and disposal days. Selling on the first
+    # anniversary is therefore too early; disposal must be after it.
+    return disposed.date() > _anniversary(acquired.date())
+
+
+@dataclass
+class InventoryLot:
+    transaction_id: str
+    account_id: str
+    acquired_at: datetime
+    quantity_remaining: Decimal
+    cost_per_unit_aud: Decimal
+
 
 @dataclass
 class CGTEvent:
-    """A single disposal event (CGT Event A1 — most common)."""
     symbol: str
     name: str
     asset_class: str
+    account_name: str
     acquired_at: datetime
     disposed_at: datetime
     holding_days: int
-    discount_eligible: bool              # held ≥ 365 days
+    discount_eligible: bool
     quantity: Decimal
-    cost_base_aud: Decimal               # ATO cost base (5 elements)
-    proceeds_aud: Decimal                # Capital proceeds
-    gross_gain_aud: Decimal              # proceeds - cost_base (before discount)
-    # After discount applied (if eligible and gain is positive):
-    discounted_gain_aud: Decimal
-    # Loss (if applicable — cannot be discounted):
+    cost_base_aud: Decimal
+    proceeds_aud: Decimal
+    gross_gain_aud: Decimal
     capital_loss_aud: Decimal
-    is_loss: bool
-    cgt_event_type: str = "A1"           # A1 = disposal of asset
-    lot_id: Optional[str] = None
+    cgt_event_type: str = "A1"
+    opening_transaction_id: Optional[str] = None
+    closing_transaction_id: Optional[str] = None
+
+    @property
+    def net_gain_aud(self) -> Decimal:
+        return self.gross_gain_aud
+
+    @property
+    def is_loss(self) -> bool:
+        return self.gross_gain_aud < ZERO
+
+
+@dataclass
+class IncomeSummary:
+    franked_dividends: Decimal = ZERO
+    unfranked_dividends: Decimal = ZERO
+    foreign_dividends: Decimal = ZERO
+    franking_credits: Decimal = ZERO
+    foreign_tax_paid: Decimal = ZERO
+    interest: Decimal = ZERO
+    staking: Decimal = ZERO
+
+    @property
+    def cash_dividends(self) -> Decimal:
+        return self.franked_dividends + self.unfranked_dividends + self.foreign_dividends
+
+    @property
+    def assessable_dividends(self) -> Decimal:
+        return self.cash_dividends + self.franking_credits
 
 
 @dataclass
 class ATOTaxReport:
-    """Complete ATO CGT report for a financial year."""
-    financial_year: int                  # e.g. 2025 for FY2024-25
-    fy_label: str                        # "FY2024-25"
-
-    # ── Gross figures (before discount) ──────────────────────────────────
-    gross_capital_gains_aud: Decimal     # Sum of all positive gross gains
-    capital_losses_aud: Decimal          # Sum of all losses (positive number)
-
-    # ── Net after loss application ────────────────────────────────────────
-    # ATO rule: losses must offset non-discount gains first, then discount gains
-    net_gain_non_discount_aud: Decimal   # After losses, from assets held < 12m
-    net_gain_discount_eligible_aud: Decimal  # After losses, from assets held ≥ 12m
-    cgt_discount_amount_aud: Decimal     # 50% of net_gain_discount_eligible
-    net_capital_gain_aud: Decimal        # ATO Schedule 3 label: "Net capital gain"
-    # Carried forward losses
-    losses_carried_forward_aud: Decimal
-
-    # ── Income ────────────────────────────────────────────────────────────
+    financial_year: int
+    fy_label: str
+    cost_method: str
+    gross_capital_gains_aud: Decimal
+    capital_losses_current_aud: Decimal
+    capital_losses_prior_aud: Decimal
+    capital_losses_applied_aud: Decimal
+    discount_gains_before_discount: Decimal
+    cgt_discount_applied: Decimal
+    net_capital_gain_aud: Decimal
+    capital_losses_carried_forward: Decimal
     dividend_income_aud: Decimal
+    franked_dividends_aud: Decimal
+    unfranked_dividends_aud: Decimal
+    foreign_dividends_aud: Decimal
+    assessable_dividend_income_aud: Decimal
+    franking_credits_aud: Decimal
+    foreign_tax_paid_aud: Decimal
     staking_income_aud: Decimal
     interest_income_aud: Decimal
-    franking_credits_aud: Decimal
-
-    # ── Tax estimates (at user's specified income) ────────────────────────
-    assumed_other_income_aud: Decimal
+    investment_deductions_aud: Decimal
+    other_income_aud: Decimal
+    other_deductions_aud: Decimal
     total_taxable_income_aud: Decimal
-    estimated_tax_aud: Decimal
-    estimated_tax_with_cgt_aud: Decimal  # Tax if CGT gain added to income
-    estimated_cgt_tax_aud: Decimal       # Marginal tax on the net capital gain
-    effective_cgt_rate_pct: Decimal
-
-    # ── Detail ────────────────────────────────────────────────────────────
+    basic_income_tax_aud: Decimal
+    lito_aud: Decimal
+    medicare_levy_aud: Decimal
+    franking_tax_offset_aud: Decimal
+    foreign_tax_offsets_aud: Decimal
+    other_tax_offsets_aud: Decimal
+    tax_withheld_aud: Decimal
+    net_tax_before_withholding_aud: Decimal
+    estimated_tax_payable_aud: Decimal
+    estimated_refund_aud: Decimal
+    estimated_tax_on_investments_aud: Decimal
+    effective_tax_rate: Decimal
     cgt_events: list[CGTEvent] = field(default_factory=list)
-    tlh_opportunities: list[dict] = field(default_factory=list)
-    total_unrealised_losses_aud: Decimal = ZERO
+    warnings: list[str] = field(default_factory=list)
+    optimization: dict[str, Any] = field(default_factory=dict)
+    rules: dict[str, Any] = field(default_factory=dict)
+
+    # Compatibility aliases used by the original router.
+    @property
+    def losses_carried_forward_aud(self) -> Decimal:
+        return self.capital_losses_carried_forward
+
+    @property
+    def cgt_discount_amount_aud(self) -> Decimal:
+        return self.cgt_discount_applied
+
+    @property
+    def capital_losses_aud(self) -> Decimal:
+        return self.capital_losses_current_aud
 
 
 class ATOTaxEngine:
-    """
-    Australian CGT calculation engine.
-
-    Implements ITAA 1997 Div 100-115 (CGT) rules:
-    - Cost base in AUD at acquisition date (RBA FX rate)
-    - 50% individual discount for assets held ≥ 365 days
-    - Loss application order: non-discount gains first, then discount gains
-    - Losses carried forward when they exceed current year gains
-    """
-
-    def __init__(self, db: AsyncSession, market_data: MarketDataService, fx_svc: FXService):
+    def __init__(self, db: AsyncSession, fx_svc: Optional[FXService] = None):
         self.db = db
-        self.market_data = market_data
-        self.fx = fx_svc
+        self.fx = fx_svc or FXService()
+
+    async def close(self) -> None:
+        await self.fx.close()
 
     async def compute_ato_report(
         self,
         user_id: str,
-        financial_year: int,                  # e.g. 2025 for FY2024-25
-        assumed_other_income_aud: Decimal = Decimal("80000"),
-        cgt_discount_rate: Decimal = Decimal("0.50"),  # 50% individual
+        fy_end_year: int,
+        cost_method: str = "FIFO",
+        settings: Optional[dict[str, Any]] = None,
         account_ids: Optional[list[str]] = None,
     ) -> ATOTaxReport:
-        """
-        Compute a complete ATO CGT report for one Australian financial year.
-        """
-        fy_start, fy_end = au_fy_bounds(financial_year)
-        fy_label = f"FY{financial_year - 1}-{str(financial_year)[2:]}"
+        method = cost_method.upper()
+        if method not in SUPPORTED_METHODS:
+            raise ValueError(f"Unsupported cost method: {cost_method}")
+        inputs = settings or {}
+        fy_start, fy_end = au_fy_bounds(fy_end_year)
+        rules = rules_for_fy(fy_end_year)
 
-        # ── Fetch disposed lots in this FY ───────────────────────────────
-        lot_query = (
-            select(TaxLot, Asset)
-            .join(Asset, TaxLot.asset_id == Asset.id)
-            .where(
-                and_(
-                    TaxLot.user_id == user_id,
-                    TaxLot.closed_at >= fy_start,
-                    TaxLot.closed_at <= fy_end,
-                    TaxLot.lot_status == "CLOSED",
-                )
-            )
-            .order_by(TaxLot.closed_at)
-        )
-        if account_ids:
-            lot_query = lot_query.where(TaxLot.account_id.in_(account_ids))
-
-        result = await self.db.execute(lot_query)
-        closed_lots = result.all()
-
-        # ── Build CGT events ─────────────────────────────────────────────
-        cgt_events: list[CGTEvent] = []
-        gross_gains = ZERO
-        total_losses = ZERO
-
-        for lot, asset in closed_lots:
-            event = await self._build_cgt_event(lot, asset)
-            cgt_events.append(event)
-            if event.is_loss:
-                total_losses += event.capital_loss_aud
-            else:
-                gross_gains += event.gross_gain_aud
-
-        # ── Fetch prior year losses carried forward ───────────────────────
-        # For a full implementation, these would come from a persistent table.
-        # For now, calculate from prior FY if possible.
-        prior_losses_cf = await self._get_prior_year_losses(user_id, financial_year)
-
-        # ── Apply losses per ATO rules ────────────────────────────────────
-        #
-        # ATO loss application order (ITAA 1997 s102-5):
-        # 1. Current year losses reduce current year gains
-        # 2. Carried-forward losses reduce current year gains
-        # 3. All losses must be applied to non-discount gains first,
-        #    then to discount-eligible gains
-        # 4. The 50% discount is applied only to the REMAINING eligible gain
-        #    after loss application.
-        #
-        available_losses = total_losses + prior_losses_cf
-
-        non_discount_events = [e for e in cgt_events if not e.is_loss and not e.discount_eligible]
-        discount_events = [e for e in cgt_events if not e.is_loss and e.discount_eligible]
-
-        gross_non_discount = sum(e.gross_gain_aud for e in non_discount_events)
-        gross_discount_eligible = sum(e.gross_gain_aud for e in discount_events)
-
-        # Apply losses to non-discount gains first
-        losses_against_non_discount = min(available_losses, gross_non_discount)
-        net_non_discount = max(ZERO, gross_non_discount - losses_against_non_discount)
-        remaining_losses = available_losses - losses_against_non_discount
-
-        # Apply remaining losses to discount-eligible gains
-        losses_against_discount = min(remaining_losses, gross_discount_eligible)
-        net_discount_before_reduction = max(ZERO, gross_discount_eligible - losses_against_discount)
-        remaining_losses = remaining_losses - losses_against_discount
-
-        # Apply 50% discount to the net discount-eligible gains
-        discount_amount = (net_discount_before_reduction * cgt_discount_rate).quantize(CENT)
-        net_discount_after_reduction = net_discount_before_reduction - discount_amount
-
-        net_capital_gain = net_non_discount + net_discount_after_reduction
-        losses_carried_forward = remaining_losses  # any unused losses carry forward
-
-        # ── Income ────────────────────────────────────────────────────────
-        div_income, staking_income, interest_income, franking_credits = await self._compute_income(
-            user_id, fy_start, fy_end
-        )
-
-        # ── Tax estimates ─────────────────────────────────────────────────
-        total_income_without_cgt = (
-            assumed_other_income_aud + div_income + staking_income + interest_income - franking_credits
-        )
-        total_income_with_cgt = total_income_without_cgt + net_capital_gain
-
-        tax_without_cgt = ato_income_tax(total_income_without_cgt)
-        tax_with_cgt = ato_income_tax(total_income_with_cgt)
-        cgt_tax = max(ZERO, tax_with_cgt - tax_without_cgt)
-
-        effective_rate = (
-            (cgt_tax / net_capital_gain * 100).quantize(CENT)
-            if net_capital_gain > ZERO else ZERO
-        )
-
-        # ── TLH opportunities ─────────────────────────────────────────────
-        tlh_opportunities, unrealised_losses = await self._find_tlh_opportunities(user_id)
-
-        return ATOTaxReport(
-            financial_year=financial_year,
-            fy_label=fy_label,
-            gross_capital_gains_aud=gross_gains,
-            capital_losses_aud=total_losses,
-            net_gain_non_discount_aud=net_non_discount,
-            net_gain_discount_eligible_aud=net_discount_before_reduction,
-            cgt_discount_amount_aud=discount_amount,
-            net_capital_gain_aud=net_capital_gain,
-            losses_carried_forward_aud=losses_carried_forward,
-            dividend_income_aud=div_income,
-            staking_income_aud=staking_income,
-            interest_income_aud=interest_income,
-            franking_credits_aud=franking_credits,
-            assumed_other_income_aud=assumed_other_income_aud,
-            total_taxable_income_aud=total_income_with_cgt,
-            estimated_tax_aud=tax_without_cgt,
-            estimated_tax_with_cgt_aud=tax_with_cgt,
-            estimated_cgt_tax_aud=cgt_tax,
-            effective_cgt_rate_pct=effective_rate,
-            cgt_events=cgt_events,
-            tlh_opportunities=tlh_opportunities,
-            total_unrealised_losses_aud=unrealised_losses,
-        )
-
-    # ── Private helpers ───────────────────────────────────────────────────────
-
-    async def _build_cgt_event(self, lot: TaxLot, asset: Asset) -> CGTEvent:
-        """Convert a closed TaxLot into an ATO CGT Event."""
-        acquired = lot.acquired_at
-        disposed = lot.closed_at or datetime.now(timezone.utc)
-        holding_days = (disposed - acquired).days
-        discount_eligible = holding_days >= 365
-
-        qty = Decimal(str(lot.quantity_acquired - lot.quantity_remaining))
-        if qty <= ZERO:
-            qty = Decimal(str(lot.quantity_acquired))
-
-        # Cost base in AUD: use stored AUD price if available,
-        # otherwise fall back to USD amount and convert via FX
-        if hasattr(lot, 'cost_basis_aud') and lot.cost_basis_aud:
-            cost_base_aud = Decimal(str(lot.cost_basis_aud))
-        else:
-            # Try to get AUD cost base from the opening transaction
-            cost_base_usd = Decimal(str(lot.total_cost_basis))
-            fx_rate = await self.fx.get_aud_rate("USD", acquired)
-            cost_base_aud = (cost_base_usd * fx_rate).quantize(CENT)
-
-        # Proceeds in AUD
-        if lot.proceeds is not None:
-            proceeds_usd = Decimal(str(lot.proceeds))
-            fx_at_disposal = await self.fx.get_aud_rate("USD", disposed)
-            proceeds_aud = (proceeds_usd * fx_at_disposal).quantize(CENT)
-        else:
-            proceeds_aud = ZERO
-
-        gross_gain = proceeds_aud - cost_base_aud
-        is_loss = gross_gain < ZERO
-
-        discounted = ZERO
-        loss = ZERO
-        if is_loss:
-            loss = abs(gross_gain)
-        else:
-            discounted = gross_gain  # discount applied at report level, not lot level
-
-        return CGTEvent(
-            symbol=asset.symbol,
-            name=asset.name,
-            asset_class=asset.asset_class,
-            acquired_at=acquired,
-            disposed_at=disposed,
-            holding_days=holding_days,
-            discount_eligible=discount_eligible,
-            quantity=qty,
-            cost_base_aud=cost_base_aud,
-            proceeds_aud=proceeds_aud,
-            gross_gain_aud=gross_gain if not is_loss else ZERO,
-            discounted_gain_aud=discounted,
-            capital_loss_aud=loss,
-            is_loss=is_loss,
-            lot_id=lot.id,
-        )
-
-    async def _compute_income(
-        self, user_id: str, fy_start: datetime, fy_end: datetime
-    ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
-        """
-        Fetch dividend income, staking income, interest, and franking credits
-        within the financial year. Returns all amounts in AUD.
-        """
         query = (
-            select(Transaction, Asset)
+            select(Transaction, Asset, Account)
+            .join(Account, Transaction.account_id == Account.id)
             .join(Asset, Transaction.asset_id == Asset.id, isouter=True)
             .where(
                 and_(
                     Transaction.user_id == user_id,
-                    Transaction.transacted_at >= fy_start,
                     Transaction.transacted_at <= fy_end,
-                    Transaction.transaction_type.in_([
-                        "DIVIDEND", "FRANKED_DIVIDEND", "STAKE_REWARD",
-                        "STAKING_REWARD", "INTEREST", "MINING_REWARD", "AIRDROP"
-                    ]),
+                    Transaction.status == "SETTLED",
+                    Account.is_taxable.is_(True),
+                    # Demo portfolios are deliberately kept outside the real
+                    # dashboard and must not leak into an ATO workpaper.
+                    Account.name.not_like("Demo - %"),
                 )
             )
+            .order_by(Transaction.transacted_at, Transaction.id)
         )
-        result = await self.db.execute(query)
-        rows = result.all()
+        if account_ids:
+            query = query.where(Transaction.account_id.in_(account_ids))
+        rows = (await self.db.execute(query)).all()
 
-        dividends = ZERO
-        staking = ZERO
-        interest = ZERO
-        franking = ZERO
+        events, event_warnings = await self._build_events(rows, fy_start, fy_end, method)
+        income, income_warnings = await self._income(rows, fy_start, fy_end, inputs)
+        cgt = self._aggregate_cgt(events, inputs, rules)
 
-        for txn, asset in rows:
-            # Use stored AUD amount if available, else convert
-            if txn.net_amount_aud:
-                aud = abs(Decimal(str(txn.net_amount_aud)))
-            elif txn.net_amount_usd:
-                rate = await self.fx.get_aud_rate("USD", txn.transacted_at)
-                aud = abs(Decimal(str(txn.net_amount_usd)) * rate)
-            elif txn.net_amount:
-                rate = await self.fx.get_aud_rate(txn.currency or "USD", txn.transacted_at)
-                aud = abs(Decimal(str(txn.net_amount)) * rate)
-            else:
-                aud = ZERO
+        investment_deductions = money(inputs.get("investment_deductions_aud"))
+        other_income = money(inputs.get("other_income_aud"))
+        other_deductions = money(inputs.get("other_deductions_aud"))
+        taxable_income = max(
+            ZERO,
+            other_income + income.assessable_dividends + income.interest + income.staking
+            + cgt["net_gain"] - investment_deductions - other_deductions,
+        )
+        eligible_franking = income.franking_credits if inputs.get("franking_credits_eligible", True) else ZERO
+        foreign_offset = income.foreign_tax_paid + money(inputs.get("other_foreign_tax_offsets_aud"))
+        calculation = calculate_tax(
+            taxable_income,
+            rules,
+            franking_offsets=eligible_franking,
+            foreign_tax_offsets=foreign_offset,
+            other_offsets=money(inputs.get("other_tax_offsets_aud")),
+            tax_withheld=money(inputs.get("tax_withheld_aud")),
+            medicare_exemption_pct=Decimal(str(inputs.get("medicare_levy_exemption_pct", 0))),
+        )
+        baseline_taxable = max(ZERO, other_income - other_deductions)
+        baseline = calculate_tax(
+            baseline_taxable,
+            rules,
+            other_offsets=money(inputs.get("other_tax_offsets_aud")),
+            tax_withheld=money(inputs.get("tax_withheld_aud")),
+            medicare_exemption_pct=Decimal(str(inputs.get("medicare_levy_exemption_pct", 0))),
+        )
+        investment_tax = money(calculation.tax_after_offsets - baseline.tax_after_offsets)
 
-            t = txn.transaction_type.upper()
-            if t in ("DIVIDEND", "FRANKED_DIVIDEND"):
-                dividends += aud
-                # Franking credits stored in raw_data if available
-                if txn.raw_data and "franking_credit" in txn.raw_data:
-                    franking += Decimal(str(txn.raw_data["franking_credit"]))
-            elif t in ("STAKE_REWARD", "STAKING_REWARD", "MINING_REWARD", "AIRDROP"):
-                staking += aud
-            elif t == "INTEREST":
-                interest += aud
-
-        return dividends, staking, interest, franking
-
-    async def _get_prior_year_losses(self, user_id: str, current_fy: int) -> Decimal:
-        """
-        Look up capital losses carried forward from prior financial years.
-        In a full implementation, these would persist in a dedicated table.
-        For now, we compute from prior year disposals as a starting point.
-        """
-        # TODO: persist carried-forward losses in a dedicated table
-        return ZERO
-
-    async def _find_tlh_opportunities(
-        self, user_id: str
-    ) -> tuple[list[dict], Decimal]:
-        """
-        Find unrealised losses that could be harvested to reduce CGT this year.
-        Returns AUD amounts.
-        """
-        lot_query = (
-            select(TaxLot, Asset)
-            .join(Asset, TaxLot.asset_id == Asset.id)
-            .where(
-                and_(
-                    TaxLot.user_id == user_id,
-                    TaxLot.lot_status.in_(["OPEN", "PARTIALLY_CLOSED"]),
+        optimization: dict[str, Any] = {
+            "losses_applied_to_non_discount_gains_first": True,
+            "selected_cost_method": method,
+            "recommendations": [],
+        }
+        if method != "TAX_OPTIMAL":
+            optimal_events, _ = await self._build_events(rows, fy_start, fy_end, "TAX_OPTIMAL")
+            optimal_cgt = self._aggregate_cgt(optimal_events, inputs, rules)
+            reduction = max(ZERO, cgt["net_gain"] - optimal_cgt["net_gain"])
+            marginal = self._marginal_rate(taxable_income, rules)
+            saving = money(reduction * marginal)
+            optimization.update({
+                "tax_optimal_net_capital_gain_aud": float(optimal_cgt["net_gain"]),
+                "potential_taxable_gain_reduction_aud": float(reduction),
+                "estimated_tax_saving_aud": float(saving),
+            })
+            if reduction > ZERO:
+                optimization["recommendations"].append(
+                    "Review the TAX_OPTIMAL parcel selection. Use it only where your records can identify the selected parcels."
                 )
+        if cgt["losses_cf"] > ZERO:
+            optimization["recommendations"].append(
+                "Carry forward unapplied capital losses; they cannot reduce salary or dividend income."
             )
+        if fy_end >= datetime.now(timezone.utc):
+            optimization["recommendations"].append(
+                "Before 30 June, review unrealised losses and near-12-month holdings with a registered tax adviser; Part IVA can apply to wash-sale arrangements."
+            )
+
+        warnings = event_warnings + income_warnings
+        if not rows:
+            warnings.append("No settled transactions were found in taxable accounts through this financial year.")
+        elif any(
+            txn.currency and txn.currency.upper() != "AUD" and txn.net_amount_aud is None
+            for txn, _asset, _account in rows
+        ):
+            warnings.append(
+                "Some foreign-currency transactions had no stored AUD value, so historical FX was fetched during this report. Verify rates before lodging."
+            )
+        if fy_end_year > 2027:
+            warnings.append(
+                "Future-year results are indicative only: Medicare thresholds and the CGT reforms applying to gains accruing from 1 July 2027 require year-specific implementation before lodging."
+            )
+        if not inputs.get("resident_full_year", True):
+            warnings.append("This estimate uses resident rates and is not valid for part-year or foreign residency without professional adjustment.")
+        warnings.append(
+            "Parcel methods rebuild selections from the full imported history. Confirm they match parcels used in any previously lodged returns."
         )
-        result = await self.db.execute(lot_query)
-        open_lots = result.all()
 
-        symbols = list({a.symbol for _, a in open_lots})
-        prices = await self.market_data.get_batch_prices(symbols)
+        effective = money((calculation.tax_after_offsets / taxable_income * Decimal("100")) if taxable_income else ZERO)
+        return ATOTaxReport(
+            financial_year=fy_end_year,
+            fy_label=f"FY{fy_end_year - 1}-{str(fy_end_year)[-2:]}",
+            cost_method=method,
+            gross_capital_gains_aud=cgt["gross_gains"],
+            capital_losses_current_aud=cgt["current_losses"],
+            capital_losses_prior_aud=cgt["prior_losses"],
+            capital_losses_applied_aud=cgt["losses_applied"],
+            discount_gains_before_discount=cgt["discount_before"],
+            cgt_discount_applied=cgt["discount"],
+            net_capital_gain_aud=cgt["net_gain"],
+            capital_losses_carried_forward=cgt["losses_cf"],
+            dividend_income_aud=income.cash_dividends,
+            franked_dividends_aud=income.franked_dividends,
+            unfranked_dividends_aud=income.unfranked_dividends,
+            foreign_dividends_aud=income.foreign_dividends,
+            assessable_dividend_income_aud=income.assessable_dividends,
+            franking_credits_aud=income.franking_credits,
+            foreign_tax_paid_aud=income.foreign_tax_paid,
+            staking_income_aud=income.staking,
+            interest_income_aud=income.interest,
+            investment_deductions_aud=investment_deductions,
+            other_income_aud=other_income,
+            other_deductions_aud=other_deductions,
+            total_taxable_income_aud=money(taxable_income),
+            basic_income_tax_aud=calculation.basic_tax,
+            lito_aud=calculation.lito,
+            medicare_levy_aud=calculation.medicare_levy,
+            franking_tax_offset_aud=money(eligible_franking),
+            foreign_tax_offsets_aud=money(foreign_offset),
+            other_tax_offsets_aud=money(inputs.get("other_tax_offsets_aud")),
+            tax_withheld_aud=money(inputs.get("tax_withheld_aud")),
+            net_tax_before_withholding_aud=calculation.tax_after_offsets,
+            estimated_tax_payable_aud=calculation.estimated_amount_due,
+            estimated_refund_aud=calculation.estimated_refund,
+            estimated_tax_on_investments_aud=investment_tax,
+            effective_tax_rate=effective,
+            cgt_events=events,
+            warnings=warnings,
+            optimization=optimization,
+            rules={
+                "fy_end_year": fy_end_year,
+                "cgt_discount_rate": float(rules.cgt_discount_rate),
+                "medicare_lower_threshold": float(rules.medicare_lower),
+                "medicare_upper_threshold": float(rules.medicare_upper),
+                "income_tax_brackets": [
+                    {"upper": float(upper), "rate": float(rate)} for upper, rate in rules.brackets
+                ],
+            },
+        )
 
-        now = datetime.now(timezone.utc)
-        opportunities = []
-        total_unrealised_loss = ZERO
+    async def _aud(self, txn: Transaction, value: Decimal, *, stored: Optional[Decimal] = None) -> Decimal:
+        if stored is not None:
+            return abs(Decimal(str(stored)))
+        rate = Decimal(str(txn.fx_rate_to_aud)) if txn.fx_rate_to_aud else await self.fx.get_aud_rate(txn.currency or "AUD", txn.transacted_at)
+        return abs(value) * rate
 
-        asset_groups: dict[str, tuple[Asset, list[TaxLot]]] = {}
-        for lot, asset in open_lots:
-            if asset.symbol not in asset_groups:
-                asset_groups[asset.symbol] = (asset, [])
-            asset_groups[asset.symbol][1].append(lot)
+    async def _transaction_value_aud(self, txn: Transaction, qty: Decimal) -> Decimal:
+        if txn.net_amount_aud is not None and Decimal(str(txn.net_amount_aud)) != ZERO:
+            return abs(Decimal(str(txn.net_amount_aud)))
+        if txn.net_amount is not None and Decimal(str(txn.net_amount)) != ZERO:
+            return await self._aud(txn, Decimal(str(txn.net_amount)))
+        price = Decimal(str(txn.price_per_unit_aud or 0))
+        if not price and txn.price_per_unit is not None:
+            price = await self._aud(txn, Decimal(str(txn.price_per_unit)))
+        fees = await self._aud(txn, Decimal(str(txn.fees or 0)))
+        gross = qty * price
+        return gross - fees if txn.transaction_type.upper() == "SELL" else gross + fees
 
-        for symbol, (asset, lots) in asset_groups.items():
-            usd_price = prices.get(symbol)
-            if not usd_price:
+    async def _build_events(self, rows: list[Any], fy_start: datetime, fy_end: datetime, method: str) -> tuple[list[CGTEvent], list[str]]:
+        inventory: dict[tuple[str, str], list[InventoryLot]] = defaultdict(list)
+        events: list[CGTEvent] = []
+        warnings: list[str] = []
+        for txn, asset, account in rows:
+            kind = txn.transaction_type.upper()
+            if asset and kind == "SWAP" and fy_start <= txn.transacted_at <= fy_end:
+                warnings.append(
+                    f"{asset.symbol} swap on {txn.transacted_at.date()} needs disposal/acquisition detail and was not automatically calculated."
+                )
+            if not asset:
+                continue
+            key = (str(txn.account_id), str(asset.id))
+            if kind == "SPLIT":
+                ratio = Decimal(str(txn.split_ratio or 0))
+                if ratio > ZERO:
+                    for lot in inventory[key]:
+                        lot.quantity_remaining *= ratio
+                        lot.cost_per_unit_aud /= ratio
+                elif fy_start <= txn.transacted_at <= fy_end:
+                    warnings.append(f"{asset.symbol} split on {txn.transacted_at.date()} has no split ratio and was skipped.")
+                continue
+            if kind not in {"BUY", "SELL"}:
+                continue
+            qty = abs(Decimal(str(txn.quantity or 0)))
+            if qty <= ZERO:
+                warnings.append(f"{asset.symbol} {txn.transaction_type} on {txn.transacted_at.date()} has no quantity and was skipped.")
+                continue
+            value = await self._transaction_value_aud(txn, qty)
+            if kind == "BUY":
+                inventory[key].append(InventoryLot(str(txn.id), str(txn.account_id), txn.transacted_at, qty, value / qty))
                 continue
 
-            # Convert current price to AUD
-            aud_rate = await self.fx.get_aud_rate("USD", now)
-            aud_price = Decimal(str(usd_price)) * aud_rate
+            sell_unit = value / qty
+            remaining = qty
+            lots = inventory[key]
 
-            total_qty = sum(Decimal(str(lot.quantity_remaining)) for lot in lots)
-            current_value_aud = (total_qty * aud_price).quantize(CENT)
+            def sort_key(lot: InventoryLot) -> Any:
+                if method == "LIFO":
+                    return (-lot.acquired_at.timestamp(),)
+                if method == "HIFO":
+                    return (-lot.cost_per_unit_aud, lot.acquired_at)
+                if method == "TAX_OPTIMAL":
+                    gain = sell_unit - lot.cost_per_unit_aud
+                    taxable = gain * (Decimal("0.50") if gain > ZERO and cgt_discount_eligible(lot.acquired_at, txn.transacted_at) else Decimal("1"))
+                    return (taxable, lot.acquired_at)
+                return (lot.acquired_at,)
 
-            # Cost base in AUD
-            total_cost_aud = ZERO
-            for lot in lots:
-                if Decimal(str(lot.quantity_remaining)) <= ZERO:
-                    continue
-                acq_rate = await self.fx.get_aud_rate("USD", lot.acquired_at)
-                lot_cost_aud = (
-                    Decimal(str(lot.quantity_remaining)) *
-                    Decimal(str(lot.cost_basis_per_unit)) *
-                    acq_rate
-                ).quantize(CENT)
-                total_cost_aud += lot_cost_aud
-
-            unrealised = current_value_aud - total_cost_aud
-
-            if unrealised < Decimal("-50"):   # Only flag losses > $50 AUD
-                holding_days = min(
-                    (now - lot.acquired_at).days for lot in lots if Decimal(str(lot.quantity_remaining)) > ZERO
+            for lot in sorted([lot for lot in lots if lot.quantity_remaining > ZERO], key=sort_key):
+                if remaining <= ZERO:
+                    break
+                matched = min(remaining, lot.quantity_remaining)
+                cost = money(matched * lot.cost_per_unit_aud)
+                proceeds = money(matched * sell_unit)
+                gain = money(proceeds - cost)
+                if fy_start <= txn.transacted_at <= fy_end:
+                    events.append(CGTEvent(
+                        asset.symbol, asset.name, asset.asset_class, account.name,
+                        lot.acquired_at, txn.transacted_at,
+                        (txn.transacted_at.date() - lot.acquired_at.date()).days,
+                        cgt_discount_eligible(lot.acquired_at, txn.transacted_at),
+                        matched.quantize(QTY), cost, proceeds, gain, money(max(ZERO, -gain)),
+                        opening_transaction_id=lot.transaction_id,
+                        closing_transaction_id=str(txn.id),
+                    ))
+                lot.quantity_remaining -= matched
+                remaining -= matched
+            if remaining > QTY:
+                warnings.append(
+                    f"{asset.symbol} sale on {txn.transacted_at.date()} has {remaining.normalize()} unmatched units; import earlier buys/transfers before relying on this report."
                 )
-                discount_eligible = holding_days >= 365
+        return events, warnings
 
-                # Marginal rate estimate at $80k income
-                marg_rate = ato_marginal_rate(Decimal("80000"))
-                # If discount-eligible loss used to offset discount-eligible gain,
-                # effective tax saving is different — we use simple marginal rate
-                tax_saving = abs(unrealised) * marg_rate
+    def _aggregate_cgt(self, events: list[CGTEvent], inputs: dict[str, Any], rules: TaxRules) -> dict[str, Decimal]:
+        non_discount = sum((e.gross_gain_aud for e in events if e.gross_gain_aud > ZERO and not e.discount_eligible), ZERO)
+        discount_gains = sum((e.gross_gain_aud for e in events if e.gross_gain_aud > ZERO and e.discount_eligible), ZERO)
+        non_discount += money(inputs.get("other_non_discount_capital_gains_aud"))
+        discount_gains += money(inputs.get("other_discount_capital_gains_aud"))
+        current_losses = sum((-e.gross_gain_aud for e in events if e.gross_gain_aud < ZERO), ZERO)
+        current_losses += money(inputs.get("other_capital_losses_aud"))
+        prior_losses = money(inputs.get("prior_year_capital_losses_aud"))
+        available = current_losses + prior_losses
+        against_other = min(available, non_discount)
+        net_other = non_discount - against_other
+        remaining = available - against_other
+        against_discount = min(remaining, discount_gains)
+        discount_before = discount_gains - against_discount
+        remaining -= against_discount
+        discount = money(discount_before * rules.cgt_discount_rate)
+        net_gain = money(net_other + discount_before - discount)
+        return {
+            "gross_gains": money(non_discount + discount_gains),
+            "current_losses": money(current_losses),
+            "prior_losses": prior_losses,
+            "losses_applied": money(against_other + against_discount),
+            "discount_before": money(discount_before),
+            "discount": discount,
+            "net_gain": net_gain,
+            "losses_cf": money(remaining),
+        }
 
-                opportunities.append({
-                    "symbol": symbol,
-                    "name": asset.name,
-                    "asset_class": asset.asset_class,
-                    "quantity": float(total_qty),
-                    "cost_base_aud": float(total_cost_aud),
-                    "current_value_aud": float(current_value_aud),
-                    "unrealised_loss_aud": float(unrealised),
-                    "estimated_tax_saving_aud": float(tax_saving),
-                    "holding_days": holding_days,
-                    "discount_eligible_if_sold_now": discount_eligible,
-                    "ato_note": (
-                        "Loss can offset your capital gains this FY. "
-                        "Apply to non-discount gains first for maximum benefit."
-                        if not discount_eligible
-                        else "Loss can offset gains. Consider waiting until 12-month mark if close."
-                    ),
-                })
-                total_unrealised_loss += unrealised
+    async def _income(self, rows: list[Any], fy_start: datetime, fy_end: datetime, inputs: dict[str, Any]) -> tuple[IncomeSummary, list[str]]:
+        result = IncomeSummary()
+        warnings: list[str] = []
+        for txn, asset, _account in rows:
+            if not (fy_start <= txn.transacted_at <= fy_end):
+                continue
+            kind = txn.transaction_type.upper()
+            if kind not in {"DIVIDEND", "FRANKED_DIVIDEND", "DISTRIBUTION", "INTEREST", "STAKE_REWARD", "STAKING_REWARD", "MINING_REWARD", "AIRDROP"}:
+                continue
+            if kind == "DISTRIBUTION":
+                warnings.append(
+                    f"{asset.symbol if asset else 'Managed fund'} distribution on {txn.transacted_at.date()} is treated as cash income; reconcile it to the annual AMMA tax statement."
+                )
+            # ATO income labels use the gross entitlement (before withholding).
+            # Only use the stored net AUD value when no explicit gross amount
+            # exists; passing it alongside gross_amount previously discarded the
+            # gross value and understated dividends.
+            has_explicit_gross = txn.gross_amount is not None and Decimal(str(txn.gross_amount)) != ZERO
+            if has_explicit_gross:
+                base = Decimal(str(txn.gross_amount))
+                amount = money(await self._aud(txn, base))
+            elif txn.net_amount_aud is not None:
+                amount = money(abs(Decimal(str(txn.net_amount_aud))))
+            elif txn.net_amount is not None:
+                amount = money(await self._aud(txn, Decimal(str(txn.net_amount))))
+            elif getattr(txn, "net_amount_usd", None) is not None:
+                amount = money(
+                    await self.fx.get_aud_rate("USD", txn.transacted_at)
+                    * abs(Decimal(str(txn.net_amount_usd)))
+                )
+            elif txn.quantity is not None and (txn.dividend_per_share is not None or txn.price_per_unit is not None):
+                payout = txn.dividend_per_share if txn.dividend_per_share is not None else txn.price_per_unit
+                amount = money(await self._aud(txn, Decimal(str(txn.quantity)) * Decimal(str(payout))))
+            else:
+                amount = ZERO
+            withheld = money(await self._aud(txn, Decimal(str(txn.tax_withheld or 0)))) if txn.tax_withheld else ZERO
+            if not has_explicit_gross:
+                amount += withheld
+            if kind == "INTEREST":
+                result.interest += amount
+            elif kind in {"STAKE_REWARD", "STAKING_REWARD", "MINING_REWARD", "AIRDROP"}:
+                result.staking += amount
+            else:
+                credit_raw = txn.franking_credit
+                if credit_raw is None and txn.raw_data:
+                    credit_raw = txn.raw_data.get("franking_credit")
+                credit = money(await self._aud(txn, Decimal(str(credit_raw or 0))))
+                is_foreign = bool(
+                    asset
+                    and (
+                        (asset.country and asset.country.upper() not in {"AU", "AUS"})
+                        or (not asset.country and (txn.currency or asset.currency or "AUD").upper() != "AUD")
+                    )
+                )
+                if is_foreign:
+                    result.foreign_dividends += amount
+                    result.foreign_tax_paid += withheld
+                elif credit > ZERO or kind == "FRANKED_DIVIDEND" or Decimal(str(txn.franking_pct or 0)) > ZERO:
+                    frank_pct = Decimal(str(txn.franking_pct or 100))
+                    if frank_pct > Decimal("1"):
+                        frank_pct /= Decimal("100")
+                    result.franked_dividends += money(amount * min(Decimal("1"), frank_pct))
+                    result.unfranked_dividends += money(amount * max(ZERO, Decimal("1") - frank_pct))
+                    result.franking_credits += credit
+                    if credit == ZERO:
+                        warnings.append(f"{asset.symbol if asset else 'Dividend'} on {txn.transacted_at.date()} is marked franked but has no franking credit amount.")
+                else:
+                    result.unfranked_dividends += amount
 
-        opportunities.sort(key=lambda x: x["unrealised_loss_aud"])
-        return opportunities, total_unrealised_loss
+        result.franked_dividends += money(inputs.get("other_franked_dividends_aud"))
+        result.unfranked_dividends += money(inputs.get("other_unfranked_dividends_aud"))
+        result.foreign_dividends += money(inputs.get("other_foreign_dividends_aud"))
+        result.franking_credits += money(inputs.get("other_franking_credits_aud"))
+        result.foreign_tax_paid += money(inputs.get("foreign_tax_paid_aud"))
+        result.interest += money(inputs.get("other_interest_income_aud"))
+        result.staking += money(inputs.get("other_staking_income_aud"))
+        for field_name in result.__dataclass_fields__:
+            setattr(result, field_name, money(getattr(result, field_name)))
+        return result, warnings
+
+    @staticmethod
+    def _marginal_rate(income: Decimal, rules: TaxRules) -> Decimal:
+        for upper, rate in rules.brackets:
+            if income <= upper:
+                return rate + Decimal("0.02")
+        return Decimal("0.47")
 
 
-# ── ATO Schedule 3 formatter ─────────────────────────────────────────────────
-
-def format_ato_schedule3(report: ATOTaxReport) -> dict:
-    """
-    Format the CGT report as ATO Schedule 3 (Capital Gains) labels.
-    These map directly to what your tax agent or myTax expects.
-    """
+def format_ato_schedule3(report: ATOTaxReport) -> dict[str, Any]:
+    """Individual return Item 18 labels (H total, A net, V losses)."""
     return {
-        "schedule": "Capital gains tax (CGT) schedule",
+        "schedule": "Individual tax return – Item 18 Capital gains",
         "financial_year": report.fy_label,
-        # ATO label references (e.g. item 18 in individual tax return)
-        "18A_gross_capital_gains": str(report.gross_capital_gains_aud),
-        "18B_capital_losses_current_year": str(report.capital_losses_aud),
-        "18V_net_capital_gain": str(report.net_capital_gain_aud),
-        "18H_losses_carried_forward": str(report.losses_carried_forward_aud),
-        # Breakdown for tax agent
-        "cgt_discount_applied": str(report.cgt_discount_amount_aud),
-        "discount_eligible_gains_before_discount": str(report.net_gain_discount_eligible_aud),
-        "non_discount_gains": str(report.net_gain_non_discount_aud),
-        # Income items
-        "dividend_income": str(report.dividend_income_aud),
-        "franking_credits": str(report.franking_credits_aud),
-        "staking_and_crypto_income": str(report.staking_income_aud),
-        "interest_income": str(report.interest_income_aud),
-        # Estimates (not on ATO form — for planning only)
-        "estimated_cgt_tax_aud": str(report.estimated_cgt_tax_aud),
-        "effective_cgt_rate_pct": str(report.effective_cgt_rate_pct),
+        "18H_total_current_year_capital_gains": str(report.gross_capital_gains_aud),
+        "18A_net_capital_gain": str(report.net_capital_gain_aud),
+        "18V_net_capital_losses_carried_forward": str(report.capital_losses_carried_forward),
+        "current_year_capital_losses": str(report.capital_losses_current_aud),
+        "prior_year_losses_applied": str(report.capital_losses_prior_aud),
+        "total_cgt_discount_applied": str(report.cgt_discount_applied),
+        "11S_unfranked_dividends": str(report.unfranked_dividends_aud),
+        "11T_franked_dividends": str(report.franked_dividends_aud),
+        "11U_franking_credits": str(report.franking_credits_aud),
         "cgt_events_count": len(report.cgt_events),
-        "note": (
-            "Net capital gain at 18V is what you enter in your tax return. "
-            "Estimated tax figures are indicative only — consult a registered tax agent."
-        ),
+        "warnings": report.warnings,
+        "note": "Use as a workpaper and reconcile it to broker and dividend statements before lodging.",
     }

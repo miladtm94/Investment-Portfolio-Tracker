@@ -10,6 +10,22 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     debug: bool = False
 
+    # ─── CORS ─────────────────────────────────────────────────────────────
+    # Host port the frontend is served on; its localhost origins are always allowed
+    frontend_port: int = 3000
+    # Extra allowed origins, comma-separated (e.g. "https://app.example.com,http://192.168.1.10:3000")
+    cors_origins: str = ""
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        origins = {
+            f"http://{host}:{port}"
+            for host in ("localhost", "127.0.0.1")
+            for port in {3000, self.frontend_port}
+        }
+        origins.update(o.strip().rstrip("/") for o in self.cors_origins.split(",") if o.strip())
+        return sorted(origins)
+
     # ─── Australian localisation ──────────────────────────────────────────
     default_currency: str = "AUD"
     default_timezone: str = "Australia/Sydney"
@@ -93,7 +109,7 @@ class Settings(BaseSettings):
     binance_api_secret: SecretStr = SecretStr("")
 
     class Config:
-        env_file = ".env"
+        env_file = (".env", "../.env")
         case_sensitive = False
 
 

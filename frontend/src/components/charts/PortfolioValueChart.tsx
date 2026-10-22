@@ -40,17 +40,25 @@ interface ValueHistoryResponse {
 
 const DEFAULT_BENCHMARKS: BenchmarkMeta[] = [
   { key: "sp500", symbol: "SPY", label: "S&P 500" },
-  { key: "btc", symbol: "BTC", label: "BTC" },
+  { key: "btc", symbol: "BTC", label: "Crypto (BTC)" },
+  { key: "cash_5", symbol: "CASH5", label: "Cash 5%" },
 ];
 
-const BENCHMARK_STYLES: Record<string, { color: string; dash?: string }> = {
-  sp500: { color: "#10b981", dash: "4 4" },
-  btc: { color: "#f59e0b", dash: "2 5" },
+const PORTFOLIO_COLOR = "#22c55e";
+
+const BENCHMARK_STYLES: Record<string, { color: string; dash?: string; width?: number }> = {
+  sp500: { color: "#3b82f6", dash: "9 5", width: 2.25 },
+  btc: { color: "#a16207", width: 3 },
+  cash_5: { color: "#f8fafc", dash: "2 7", width: 2.25 },
 };
 
 interface Props {
   period?: string;
   currency?: string;
+  onPeriodChange?: (period: string) => void;
+  showPeriodSelector?: boolean;
+  customStartDate?: string;
+  customEndDate?: string;
 }
 
 function isPeriodKey(period?: string): period is PeriodKey {
@@ -173,7 +181,14 @@ function tickInterval(dataLen: number, period: PeriodKey): number | "preserveSta
   return Math.max(Math.floor(dataLen / 6), 1);
 }
 
-export function PortfolioValueChart({ period: _initialPeriod = "1Y", currency = "AUD" }: Props) {
+export function PortfolioValueChart({
+  period: _initialPeriod = "1Y",
+  currency = "AUD",
+  onPeriodChange,
+  showPeriodSelector = true,
+  customStartDate,
+  customEndDate,
+}: Props) {
   const [activePeriod, setActivePeriod] = useState<PeriodKey>(() => normalizePeriod(_initialPeriod));
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState("");
@@ -181,6 +196,7 @@ export function PortfolioValueChart({ period: _initialPeriod = "1Y", currency = 
   const [visibleBenchmarks, setVisibleBenchmarks] = useState<Record<string, boolean>>({
     sp500: true,
     btc: true,
+    cash_5: true,
   });
 
   useEffect(() => {
@@ -192,26 +208,32 @@ export function PortfolioValueChart({ period: _initialPeriod = "1Y", currency = 
   }, [_initialPeriod]);
 
   // Build query params
-  const isCustom = activePeriod === "CUSTOM" && appliedCustom;
+  const externalCustom = customStartDate && customEndDate
+    ? { start: customStartDate, end: customEndDate }
+    : null;
+  const activeCustom = externalCustom ?? appliedCustom;
+  const isCustom = activePeriod === "CUSTOM" && activeCustom;
   const queryPeriod = isCustom ? "CUSTOM" : activePeriod;
   const queryParams = new URLSearchParams();
   if (isCustom) {
-    queryParams.set("start_date", appliedCustom.start);
-    queryParams.set("end_date", appliedCustom.end);
+    queryParams.set("period", "CUSTOM");
+    queryParams.set("start_date", activeCustom.start);
+    queryParams.set("end_date", activeCustom.end);
   } else {
     queryParams.set("period", activePeriod);
   }
-  queryParams.set("benchmarks", "SPY,BTC");
+  queryParams.set("benchmarks", "SPY,BTC,CASH5");
   if (currency && currency !== "AUD") {
     queryParams.set("currency", currency);
   }
 
   const { data, isLoading, isFetching } = useQuery<ValueHistoryResponse>({
-    queryKey: ["portfolio", "value-history", queryPeriod, appliedCustom, currency],
+    queryKey: ["portfolio", "value-history", queryPeriod, activeCustom, currency],
     queryFn: () =>
       api.get(`/analytics/portfolio-value-history?${queryParams.toString()}`).then((r) => r.data),
-    staleTime: 60 * 1000,
-    enabled: activePeriod !== "CUSTOM" || !!appliedCustom,
+    placeholderData: (previousData) => previousData,
+    staleTime: 5 * 60 * 1000,
+    enabled: activePeriod !== "CUSTOM" || !!activeCustom,
   });
 
   const chartData = data?.data ?? [];
@@ -220,11 +242,11 @@ export function PortfolioValueChart({ period: _initialPeriod = "1Y", currency = 
   const startVal = chartData[0]?.value ?? 0;
   const endVal = chartData[chartData.length - 1]?.value ?? 0;
   const change = endVal - startVal;
-  const changePct = startVal > 0 ? ((change / startVal) * 100).toFixed(2) : "0.00";
-  const isPositive = change >= 0;
+  const portfolioReturnPct = startVal > 0 ? (change / startVal) * 100 : null;
 
   const handlePeriodChange = (p: PeriodKey) => {
     setActivePeriod(p);
+    onPeriodChange?.(p);
     if (p !== "CUSTOM") {
       setAppliedCustom(null);
     }
@@ -249,39 +271,47 @@ export function PortfolioValueChart({ period: _initialPeriod = "1Y", currency = 
             <TrendingUp className="w-4 h-4 text-blue-400" />
             Portfolio Value
           </h3>
-          {chartData.length > 0 && (
-            <div className="flex items-center gap-3 mt-1">
-              <span className="text-lg font-bold text-gray-100">
-                {formatCurrency(endVal, false, currency)}
-              </span>
-              <span className={`text-sm font-medium ${isPositive ? "text-green-400" : "text-red-400"}`}>
-                {isPositive ? "+" : ""}{formatCurrency(change, false, currency)} ({isPositive ? "+" : ""}{changePct}%)
-              </span>
-            </div>
-          )}
+          <p className="text-xs text-gray-500 mt-1">
+            Curves are indexed to the selected period start.
+          </p>
         </div>
 
-        {/* Period Tabs */}
-        <div className="flex flex-wrap items-center gap-1 bg-gray-800/60 rounded-lg p-0.5 border border-gray-700/50">
-          {PERIOD_OPTIONS.map(({ key, label }) => (
-            <button
-              key={key}
-              onClick={() => handlePeriodChange(key)}
-              className={clsx(
-                "px-2.5 py-1 text-xs font-medium rounded-md transition-all",
-                activePeriod === key
-                  ? "bg-blue-600 text-white shadow-sm"
-                  : "text-gray-400 hover:text-gray-200 hover:bg-gray-700/50"
-              )}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
+        {showPeriodSelector && (
+          <div className="flex flex-wrap items-center gap-1 bg-gray-800/60 rounded-lg p-0.5 border border-gray-700/50">
+            {PERIOD_OPTIONS.map(({ key, label }) => (
+              <button
+                key={key}
+                onClick={() => handlePeriodChange(key)}
+                className={clsx(
+                  "px-2.5 py-1 text-xs font-medium rounded-md transition-all",
+                  activePeriod === key
+                    ? "bg-blue-600 text-white shadow-sm"
+                    : "text-gray-400 hover:text-gray-200 hover:bg-gray-700/50"
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
-      {benchmarks.length > 0 && (
+      {(chartData.length > 0 || benchmarks.length > 0) && (
         <div className="flex flex-wrap items-center gap-2 mb-4">
+          {chartData.length > 0 && (
+            <div className="flex items-center gap-2 rounded-md border border-green-500/30 bg-green-500/10 px-2.5 py-1 text-xs font-medium text-gray-100">
+              <span
+                className="h-0.5 w-7 rounded-full"
+                style={{ backgroundColor: PORTFOLIO_COLOR }}
+              />
+              <span>My Portfolio</span>
+              {portfolioReturnPct !== null && (
+                <span className={portfolioReturnPct >= 0 ? "text-green-400" : "text-red-400"}>
+                  {formatPercent(portfolioReturnPct)}
+                </span>
+              )}
+            </div>
+          )}
           {benchmarks.map((benchmark) => {
             const style = benchmarkStyle(benchmark.key);
             const isVisible = visibleBenchmarks[benchmark.key] !== false;
@@ -314,7 +344,7 @@ export function PortfolioValueChart({ period: _initialPeriod = "1Y", currency = 
       )}
 
       {/* Custom Date Range Picker */}
-      {activePeriod === "CUSTOM" && (
+      {activePeriod === "CUSTOM" && showPeriodSelector && (
         <div className="flex flex-wrap items-center gap-2 mb-4 text-xs">
           <Calendar className="w-3.5 h-3.5 text-gray-500" />
           <input
@@ -363,8 +393,8 @@ export function PortfolioValueChart({ period: _initialPeriod = "1Y", currency = 
             <ComposedChart data={chartData} margin={{ top: 5, right: 5, left: 5, bottom: 5 }}>
               <defs>
                 <linearGradient id="portfolioGradient" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor={isPositive ? "#3b82f6" : "#ef4444"} stopOpacity={0.3} />
-                  <stop offset="95%" stopColor={isPositive ? "#3b82f6" : "#ef4444"} stopOpacity={0} />
+                  <stop offset="5%" stopColor={PORTFOLIO_COLOR} stopOpacity={0.35} />
+                  <stop offset="95%" stopColor={PORTFOLIO_COLOR} stopOpacity={0} />
                 </linearGradient>
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
@@ -401,11 +431,11 @@ export function PortfolioValueChart({ period: _initialPeriod = "1Y", currency = 
               <Area
                 type="monotone"
                 dataKey="value"
-                stroke={isPositive ? "#3b82f6" : "#ef4444"}
-                strokeWidth={2}
+                stroke={PORTFOLIO_COLOR}
+                strokeWidth={3}
                 fill="url(#portfolioGradient)"
                 dot={false}
-                activeDot={{ r: 4, fill: isPositive ? "#3b82f6" : "#ef4444" }}
+                activeDot={{ r: 5, fill: PORTFOLIO_COLOR, stroke: "#dbeafe", strokeWidth: 1 }}
               />
               {activeBenchmarks.map((benchmark) => {
                 const style = benchmarkStyle(benchmark.key);
@@ -416,7 +446,7 @@ export function PortfolioValueChart({ period: _initialPeriod = "1Y", currency = 
                     dataKey={benchmark.key}
                     name={benchmark.label}
                     stroke={style.color}
-                    strokeWidth={2}
+                    strokeWidth={style.width ?? 2}
                     strokeDasharray={style.dash}
                     dot={false}
                     activeDot={{ r: 3, fill: style.color }}
